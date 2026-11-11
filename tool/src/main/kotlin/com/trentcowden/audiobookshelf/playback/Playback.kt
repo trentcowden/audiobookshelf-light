@@ -331,12 +331,37 @@ object Playback {
      * Plays a downloaded book from wherever you left off (on this phone or
      * another device, whichever is newer). If it's already loaded this resumes.
      */
-    fun playBook(itemId: String) {
+    fun playBook(itemId: String, startAtMs: Long? = null) {
         scope.launch {
             lock.withLock {
-                if (book?.itemId == itemId) resumeLocked() else openLocked(itemId)
+                if (book?.itemId == itemId) resumeLocked() else openLocked(itemId, startAtMs)
             }
         }
+    }
+
+    /**
+     * Best position this phone knows for a downloaded book without asking the
+     * server: the newer of local progress and the last library listing.
+     */
+    fun bestKnownPositionSec(itemId: String): Double {
+        val local = LocalProgress.get(itemId)
+        val cached = LibraryCache.load()?.progress?.get(itemId)
+        return when {
+            cached != null && (local == null || cached.lastUpdate > local.updatedAt) -> cached.currentTime
+            else -> local?.positionSec ?: 0.0
+        }
+    }
+
+    /**
+     * Newest-wins check against the server for a book about to be shown (the
+     * player preview), so Play can start straight away from the right spot.
+     * Returns false when the server can't be reached. Never throws.
+     */
+    suspend fun refreshFromServer(itemId: String): Boolean {
+        val b = Downloads.book(itemId) ?: return false
+        return withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
+            withContext(Dispatchers.IO) { runCatching { reconcileItem(itemId, b.durationSec) }.isSuccess }
+        } == true
     }
 
     fun togglePlay() {
@@ -521,7 +546,13 @@ object Playback {
             positionMs
         }
 
-    private suspend fun openLocked(itemId: String) {
+    /**
+     * Loads and plays a downloaded book. With [startAtMs] (the player preview
+     * already checked the server, or you picked a spot) playback starts at
+     * once and the sync session opens in the background; without it, the
+     * server is asked first.
+     */
+    private suspend fun openLocked(itemId: String, startAtMs: Long? = null) {
         _error.value = null
         val b = Downloads.book(itemId) ?: run {
             _error.value = "Download this book first."
@@ -543,6 +574,23 @@ object Playback {
             chapters = b.chapters,
             loading = true,
         )
+        if (startAtMs != null) {
+            session = null
+            resetSyncClock()
+            lastSavedPositionMs = -1 // a chosen spot counts as new progress
+            val target = startAtMs.coerceIn(0, (b.durationSec * 1000).toLong().coerceAtLeast(0))
+            _state.update { it?.copy(positionMs = target) }
+            val h = ensureHandle()
+            if (h == null) {
+                _state.update { it?.copy(loading = false) }
+                return
+            }
+            loadQueue(h, b, target)
+            startAndVerify(h)
+            startSyncLoop()
+            openSessionInBackground(b)
+            return
+        }
         // Online: newest of phone/server wins, then open a sync session.
         // Offline: newest of the phone's copy and the last library listing.
         val reconciled = withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
@@ -592,6 +640,36 @@ object Playback {
             _state.update { it?.copy(offline = false) }
         } else {
             _state.update { it?.copy(offline = true) }
+        }
+    }
+
+    /**
+     * Opens the sync session without holding the player lock during the
+     * network call, so taps stay responsive while it connects.
+     */
+    private fun openSessionInBackground(b: DownloadedBook) {
+        lastReconnectAt = System.currentTimeMillis()
+        scope.launch {
+            val opened = withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
+                withContext(Dispatchers.IO) { runCatching { AbsApi.startPlayback(b.itemId) }.getOrNull() }
+            }
+            lock.withLock {
+                if (book?.itemId != b.itemId || session != null) {
+                    // Switched books meanwhile: don't leave a stray session open.
+                    if (opened != null && session?.id != opened.id) {
+                        launch(Dispatchers.IO) { runCatching { AbsApi.closeSession(opened.id, null) } }
+                    }
+                    return@withLock
+                }
+                if (opened != null) {
+                    session = opened
+                    sessionStale = false
+                    _state.update { it?.copy(offline = false) }
+                    syncNow()
+                } else {
+                    _state.update { it?.copy(offline = true) }
+                }
+            }
         }
     }
 

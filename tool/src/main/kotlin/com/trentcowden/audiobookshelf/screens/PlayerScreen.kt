@@ -14,6 +14,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.em
 import com.thelightphone.sdk.LightViewModel
+import com.thelightphone.sdk.SimpleLightScreen
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
@@ -35,14 +39,48 @@ import com.trentcowden.audiobookshelf.downloads.DownloadState
 import com.trentcowden.audiobookshelf.downloads.Downloads
 import com.thelightphone.sdk.ui.LightTopBar
 
-/** Playback state lives in [Playback]; the screen only keeps its bar-scope preference. */
-class PlayerViewModel : LightViewModel<Unit>() {
-    val chapterScoped = kotlinx.coroutines.flow.MutableStateFlow(SettingsStore.chapterScopedBar)
+/**
+ * Playback state lives in [Playback]. For a downloaded book that isn't loaded
+ * yet, the screen keeps a *preview* position: the full player shows straight
+ * away, seeking/skipping/chapters just move where Play will start, and the
+ * server's position is checked in the background while you look.
+ */
+class PlayerViewModel(private val itemId: String) : LightViewModel<Unit>() {
+    val chapterScoped = MutableStateFlow(SettingsStore.chapterScopedBar)
+
+    /** Where Play starts for a book that isn't loaded (ms on the book timeline). */
+    val previewPositionMs = MutableStateFlow((Playback.bestKnownPositionSec(itemId) * 1000).toLong())
+
+    /** The server check finished (or you picked a spot), so Play can start at once. */
+    private var previewSettled = false
+    private var userMoved = false
 
     fun toggleScope() {
         val next = !chapterScoped.value
         chapterScoped.value = next
         SettingsStore.chapterScopedBar = next
+    }
+
+    override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
+        super.onScreenShow(screen)
+        if (Playback.state.value?.itemId == itemId || Downloads.book(itemId) == null) return
+        viewModelScope.launch {
+            Playback.refreshFromServer(itemId)
+            if (!userMoved) previewPositionMs.value = (Playback.bestKnownPositionSec(itemId) * 1000).toLong()
+            // Offline counts as settled too: the phone's copy is the best there is.
+            previewSettled = true
+        }
+    }
+
+    fun movePreview(targetMs: Long, durationMs: Long) {
+        userMoved = true
+        previewSettled = true
+        previewPositionMs.value = targetMs.coerceIn(0, durationMs.coerceAtLeast(0))
+    }
+
+    /** Start playing from the preview — immediately if the position is settled. */
+    fun play() {
+        Playback.playBook(itemId, startAtMs = if (previewSettled) previewPositionMs.value else null)
     }
 }
 
@@ -57,7 +95,7 @@ class PlayerScreen(
 
     override fun createViewModel(): PlayerViewModel {
         AppInit.init(lightContext.filesDir)
-        return PlayerViewModel()
+        return PlayerViewModel(itemId)
     }
 
     @Composable
@@ -122,9 +160,24 @@ class PlayerScreen(
                     verticalArrangement = Arrangement.SpaceEvenly,
                 ) {
                 when {
-                    live != null -> LiveControls(live, speed, onOpenChapters = { openChapters(live) })
-                    download is DownloadState.Done -> BigButton(LightIcons.PLAY, "Play") {
-                        Playback.playBook(itemId)
+                    live != null -> LiveControls(live, speed, preview = false)
+                    download is DownloadState.Done -> {
+                        // Not loaded yet: show the whole player from the download
+                        // and the best-known position; Play starts from there.
+                        val previewMs by viewModel.previewPositionMs.collectAsState()
+                        LiveControls(
+                            NowPlaying(
+                                itemId = itemId,
+                                title = download.book.title,
+                                author = download.book.author,
+                                durationMs = (download.book.durationSec * 1000).toLong(),
+                                positionMs = previewMs,
+                                playing = false,
+                                chapters = download.book.chapters,
+                            ),
+                            speed,
+                            preview = true,
+                        )
                     }
                     download is DownloadState.Queued -> Status("Waiting to download…")
                     download is DownloadState.Running -> Column(modifier = Modifier.fillMaxWidth()) {
@@ -165,7 +218,12 @@ class PlayerScreen(
     }
 
     @Composable
-    private fun LiveControls(live: NowPlaying, speed: Float, onOpenChapters: () -> Unit) {
+    private fun LiveControls(live: NowPlaying, speed: Float, preview: Boolean) {
+        // A preview only moves where Play will start; live controls drive the player.
+        val seekTo: (Long) -> Unit = { ms ->
+            if (preview) viewModel.movePreview(ms, live.durationMs) else Playback.seekTo(ms)
+        }
+        val onOpenChapters = { openChapters(live, seekTo) }
         val themeColors by LightThemeController.colors.collectAsState()
         val chapterScoped by viewModel.chapterScoped.collectAsState()
         val chapterIndex = chapterIndexAt(live.chapters, live.positionMs)
@@ -196,7 +254,7 @@ class PlayerScreen(
                 colors = themeColors,
                 progress = if (lengthMs > 0) withinMs.toFloat() / lengthMs else 0f,
                 onValueChange = { fraction ->
-                    if (lengthMs > 0) Playback.seekTo(startMs + (lengthMs * fraction.coerceIn(0f, 1f)).toLong())
+                    if (lengthMs > 0) seekTo(startMs + (lengthMs * fraction.coerceIn(0f, 1f)).toLong())
                 },
             )
             // Elapsed · percent · remaining, all for the bar's scope. Tapping
@@ -240,7 +298,7 @@ class PlayerScreen(
                     modifier = Modifier.lightClickable { openSpeed() },
                 )
             }
-            TransportButton(LightIcons.SKIP_BACKWARD_FIFTEEN, "Back 15 seconds") { Playback.seekBy(-15_000) }
+            TransportButton(LightIcons.SKIP_BACKWARD_FIFTEEN, "Back 15 seconds") { seekTo(live.positionMs - 15_000) }
             if (live.loading) {
                 androidx.compose.foundation.layout.Box(
                     modifier = Modifier.width(3f.gridUnitsAsDp()),
@@ -250,9 +308,9 @@ class PlayerScreen(
                 TransportButton(
                     if (live.playing) LightIcons.PAUSE else LightIcons.PLAY,
                     if (live.playing) "Pause" else "Play",
-                ) { Playback.togglePlay() }
+                ) { if (preview) viewModel.play() else Playback.togglePlay() }
             }
-            TransportButton(LightIcons.SKIP_FORWARD_FIFTEEN, "Forward 15 seconds") { Playback.seekBy(15_000) }
+            TransportButton(LightIcons.SKIP_FORWARD_FIFTEEN, "Forward 15 seconds") { seekTo(live.positionMs + 15_000) }
             androidx.compose.foundation.layout.Spacer(Modifier.width(SPEED_SLOT.gridUnitsAsDp()))
         }
     }
@@ -306,10 +364,10 @@ class PlayerScreen(
         navigateTo(screenFactory = { SpeedScreen(it) }) { Playback.setSpeed(it) }
     }
 
-    private fun openChapters(live: NowPlaying) {
+    private fun openChapters(live: NowPlaying, seekTo: (Long) -> Unit) {
         val current = chapterIndexAt(live.chapters, live.positionMs)
         navigateTo(screenFactory = { ChaptersScreen(it, live.chapters, current) }) { index ->
-            live.chapters.getOrNull(index)?.let { Playback.seekTo(chapterStartMs(it)) }
+            live.chapters.getOrNull(index)?.let { seekTo(chapterStartMs(it)) }
         }
     }
 }
