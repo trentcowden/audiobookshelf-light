@@ -16,6 +16,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Icon
+import androidx.compose.ui.res.painterResource
+import com.thelightphone.sdk.ui.LightThemeTokens
+import com.trentcowden.audiobookshelf.R
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.em
 import com.thelightphone.sdk.ui.LightProgressBar
@@ -66,29 +71,37 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
                     overflow = TextOverflow.Ellipsis,
                     lineHeight = 1.15.em,
                 )
-                val detail = listOfNotNull(row.author, downloadLabel).joinToString(" · ")
-                if (detail.isNotEmpty()) {
-                    LightText(
-                        text = detail,
-                        variant = LightTextVariant.Detail,
-                        modifier = Modifier.padding(top = 0.2f.gridUnitsAsDp()),
-                    )
-                }
-                primarySeries(row.series)?.let { series ->
+                val series = primarySeries(row.series)
+                if (series != null) {
                     LightText(
                         text = series,
                         variant = LightTextVariant.Detail,
                         lighten = true,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 0.2f.gridUnitsAsDp()),
+                    )
+                }
+                val detail = listOfNotNull(row.author, downloadLabel).joinToString(" · ")
+                if (detail.isNotEmpty()) {
+                    LightText(
+                        text = detail,
+                        variant = LightTextVariant.Detail,
+                        modifier = if (series == null) Modifier.padding(top = 0.2f.gridUnitsAsDp()) else Modifier,
                     )
                 }
             }
-            val label = when {
-                row.finished -> "done"
-                row.progress != null -> "${(row.progress * 100).toInt().coerceIn(1, 99)}%"
-                else -> null
+            if (row.finished) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_check_white),
+                    contentDescription = "Finished",
+                    tint = LightThemeTokens.colors.content,
+                    modifier = Modifier
+                        .padding(start = 0.5f.gridUnitsAsDp(), top = 0.3f.gridUnitsAsDp())
+                        .size(1.15f.gridUnitsAsDp()),
+                )
             }
+            val label = row.progress?.takeIf { !row.finished }?.let { "${(it * 100).toInt().coerceIn(1, 99)}%" }
             if (label != null) {
                 LightText(
                     text = label,

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Checkmark in the style of the Light SDK icons (solid strokes, square
+     ends, same stroke weight as ic_downloaded_arrow_white). The SDK has no
+     checkmark, and LightIconConfiguration is sealed, so the tool ships its own. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="40dp"
+    android:viewportWidth="40"
+    android:viewportHeight="40">
+    <path
+        android:pathData="M 4,21 L 15,32 L 36,9"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5.6"
+        android:strokeLineCap="butt"
+        android:strokeLineJoin="miter" />
+</vector>
