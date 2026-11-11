@@ -1,0 +1,462 @@
+package com.trentcowden.audiobookshelf.api
+
+import io.ktor.client.HttpClient
+import io.ktor.client.call.body
+import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.HttpRequestBuilder
+import io.ktor.client.plugins.HttpTimeoutConfig
+import io.ktor.client.plugins.timeout
+import io.ktor.client.request.get
+import io.ktor.client.request.prepareGet
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.HttpHeaders
+import io.ktor.http.contentLength
+import io.ktor.utils.io.readAvailable
+import io.ktor.client.request.header
+import io.ktor.client.request.patch
+import io.ktor.client.request.post
+import io.ktor.client.request.request
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
+import io.ktor.http.HttpMethod
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.contentType
+import io.ktor.http.isSuccess
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import java.io.IOException
+
+/** A failure worth showing to the user, already phrased for them. */
+open class AbsException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/** The stored sign-in no longer works (refresh rejected) — the user has to log in again. */
+class SignedOutException : AbsException("Signed out. Please log in again.")
+
+/** The server no longer knows this playback session (restarted, or closed it as stale). */
+class SessionGoneException : AbsException("Playback session expired.")
+
+/**
+ * Minimal Audiobookshelf client. Every call carries `Authorization: Bearer`; an
+ * expired access token is refreshed once (2.26+ servers) and the call retried.
+ * Books are downloaded through the same authenticated file endpoint.
+ */
+object AbsApi {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = false
+        coerceInputValues = true
+    }
+
+    private val client = HttpClient(OkHttp) {
+        install(ContentNegotiation) { json(json) }
+        install(HttpTimeout) {
+            connectTimeoutMillis = 10_000
+            requestTimeoutMillis = 30_000
+            socketTimeoutMillis = 30_000
+        }
+        expectSuccess = false
+    }
+
+    private val refreshLock = Mutex()
+
+    // ---- Sign-in -------------------------------------------------------------
+
+    /** "abs.example.com" → "https://abs.example.com"; trims spaces and trailing slashes. */
+    fun normalizeServerUrl(input: String): String {
+        val trimmed = input.trim().trimEnd('/')
+        if (trimmed.isEmpty()) return trimmed
+        return if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true)) {
+            trimmed
+        } else {
+            "https://$trimmed"
+        }
+    }
+
+    /** Server status plus the base URL it actually answered on (after redirects). */
+    data class Reached(val baseUrl: String, val status: ServerStatus)
+
+    suspend fun status(serverUrl: String): ServerStatus = reach(serverUrl).status
+
+    private suspend fun reach(serverUrl: String): Reached {
+        val response = network { client.get("$serverUrl/status") }
+        if (!response.status.isSuccess()) {
+            throw AbsException("That doesn't look like an Audiobookshelf server (HTTP ${response.status.value}).")
+        }
+        val status = runCatching { response.body<ServerStatus>() }.getOrNull()
+        if (status == null || status.app?.lowercase() != "audiobookshelf") {
+            throw AbsException("That doesn't look like an Audiobookshelf server.")
+        }
+        // Store the URL the server really lives at (e.g. http→https redirect):
+        // the audio player can't follow cross-protocol redirects.
+        val finalUrl = response.call.request.url.toString().substringBefore("?")
+        val base = finalUrl.removeSuffix("/status").trimEnd('/').ifEmpty { serverUrl }
+        return Reached(base, status)
+    }
+
+    /** Typed without a scheme: try https first, then plain http (home-network servers). */
+    private suspend fun reachTypedServer(raw: String): Reached {
+        val normalized = normalizeServerUrl(raw)
+        val typedScheme = raw.trim().startsWith("http://", true) || raw.trim().startsWith("https://", true)
+        return try {
+            reach(normalized)
+        } catch (e: AbsException) {
+            if (typedScheme) throw e
+            runCatching { reach("http://" + normalized.removePrefix("https://")) }.getOrNull() ?: throw e
+        }
+    }
+
+    /** Checks the server, logs in and returns the sign-in to persist. */
+    suspend fun login(rawServerUrl: String, username: String, password: String): AuthState {
+        if (normalizeServerUrl(rawServerUrl).isEmpty()) throw AbsException("Enter your server address.")
+        val (serverUrl, status) = reachTypedServer(rawServerUrl)
+        val response = network {
+            client.post("$serverUrl/login") {
+                header("x-return-tokens", "true")
+                contentType(ContentType.Application.Json)
+                setBody(buildJsonObject {
+                    put("username", username)
+                    put("password", password)
+                })
+            }
+        }
+        when {
+            response.status == HttpStatusCode.Unauthorized ->
+                throw AbsException("Wrong username or password.")
+            response.status == HttpStatusCode.TooManyRequests ->
+                throw AbsException("Too many login attempts. Try again later.")
+            !response.status.isSuccess() ->
+                throw AbsException("Login failed (HTTP ${response.status.value}).")
+        }
+        val user = runCatching { response.body<LoginResponse>().user }.getOrNull()
+            ?: throw AbsException("Login failed: unexpected server response.")
+        val access = user.accessToken ?: user.token
+            ?: throw AbsException("Login failed: the server returned no token.")
+        return AuthState(
+            serverUrl = serverUrl,
+            username = user.username.ifBlank { username },
+            accessToken = access,
+            refreshToken = user.refreshToken,
+        )
+    }
+
+    /** Best-effort server-side logout (invalidates the refresh token). Never throws. */
+    suspend fun logout(auth: AuthState) {
+        val refresh = auth.refreshToken ?: return
+        runCatching {
+            client.post("${auth.serverUrl}/logout") { header("x-refresh-token", refresh) }
+        }
+    }
+
+    // ---- Library ---------------------------------------------------------------
+
+    suspend fun bookLibraries(): List<Library> =
+        authed(HttpMethod.Get, "/api/libraries").body<LibrariesResponse>()
+            .libraries.filter { it.mediaType == "book" }
+
+    /** Every book in a library, sorted by title (paged under the hood). */
+    suspend fun allBooks(libraryId: String): List<LibraryItem> {
+        val pageSize = 200
+        val all = mutableListOf<LibraryItem>()
+        var page = 0
+        while (true) {
+            val response = authed(
+                HttpMethod.Get,
+                "/api/libraries/$libraryId/items?minified=1&sort=media.metadata.title&desc=0" +
+                    "&limit=$pageSize&page=$page",
+            ).body<LibraryItemsResponse>()
+            all += response.results
+            page++
+            if (response.results.size < pageSize || all.size >= response.total) break
+        }
+        return all
+    }
+
+    /** Started-but-unfinished books, most recently listened first. */
+    suspend fun itemsInProgress(): List<LibraryItem> =
+        authed(HttpMethod.Get, "/api/me/items-in-progress").body<ItemsInProgressResponse>()
+            .libraryItems
+            .filter { it.mediaType == "book" }
+            .sortedByDescending { it.progressLastUpdate }
+
+    /** The signed-in user's progress for every book they've touched, keyed by item id. */
+    suspend fun mediaProgress(): Map<String, MediaProgress> =
+        authed(HttpMethod.Get, "/api/me").body<MeResponse>()
+            .mediaProgress
+            .filter { it.episodeId == null }
+            .associateBy { it.libraryItemId }
+
+    /** Tracks, chapters and metadata for one book. */
+    suspend fun itemDetails(itemId: String): ItemDetails =
+        authed(HttpMethod.Get, "/api/items/$itemId?expanded=1").body<ItemDetails>()
+
+    /** The server's progress for one book, or null if never started. */
+    suspend fun progressFor(itemId: String): MediaProgress? {
+        val response = authed(HttpMethod.Get, "/api/me/progress/$itemId", allow404 = true)
+        if (response.status == HttpStatusCode.NotFound) return null
+        return runCatching { response.body<MediaProgress>() }.getOrNull()
+    }
+
+    /**
+     * Downloads one audio file into [part], resuming from its current length
+     * (the server honours Range). Returns the file's total size. [onProgress]
+     * gets (bytes so far, total). Refreshes the sign-in once on 401.
+     */
+    suspend fun downloadFile(
+        itemId: String,
+        ino: String,
+        part: java.io.File,
+        onProgress: (Long, Long) -> Unit,
+    ): Long {
+        var refreshed = false
+        repeat(3) {
+            val auth = AuthStore.current ?: throw SignedOutException()
+            val offset = if (part.isFile) part.length() else 0L
+            val result = network {
+                client.prepareGet("${auth.serverUrl}/api/items/$itemId/file/$ino") {
+                    header("Authorization", "Bearer ${auth.accessToken}")
+                    if (offset > 0) header(HttpHeaders.Range, "bytes=$offset-")
+                    // A ~1 GB book takes a while: no overall deadline, only a stall timeout.
+                    timeout {
+                        requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+                        socketTimeoutMillis = 60_000
+                    }
+                }.execute { response ->
+                    when (response.status) {
+                        HttpStatusCode.Unauthorized -> return@execute -1L
+                        HttpStatusCode.RequestedRangeNotSatisfiable -> {
+                            // "bytes */N": if we already hold all N bytes (killed just
+                            // before the rename), we're done. Otherwise the file changed
+                            // on the server: start over cleanly.
+                            val size = response.headers[HttpHeaders.ContentRange]
+                                ?.substringAfterLast('/')?.toLongOrNull()
+                            if (size != null && size == offset) return@execute size
+                            part.delete()
+                            return@execute -2L
+                        }
+                        HttpStatusCode.NotFound ->
+                            throw com.trentcowden.audiobookshelf.downloads.PermanentDownloadException(
+                                "This book's audio file is gone from the server.",
+                            )
+                        else -> if (!response.status.isSuccess()) {
+                            throw AbsException("Download failed (HTTP ${response.status.value}).")
+                        }
+                    }
+                    val resumed = response.status == HttpStatusCode.PartialContent
+                    val total = if (resumed) {
+                        response.headers[HttpHeaders.ContentRange]?.substringAfterLast('/')?.toLongOrNull()
+                            ?: (offset + (response.contentLength() ?: 0))
+                    } else {
+                        response.contentLength() ?: 0
+                    }
+                    var done = if (resumed) offset else 0L
+                    val channel = response.bodyAsChannel()
+                    val buffer = ByteArray(64 * 1024)
+                    java.io.FileOutputStream(part, resumed).use { out ->
+                        var lastReport = 0L
+                        while (true) {
+                            val n = channel.readAvailable(buffer, 0, buffer.size)
+                            if (n == -1) break
+                            if (n > 0) {
+                                out.write(buffer, 0, n)
+                                done += n
+                                val now = System.currentTimeMillis()
+                                if (now - lastReport > 500) {
+                                    lastReport = now
+                                    onProgress(done, total)
+                                }
+                            }
+                        }
+                    }
+                    onProgress(done, total)
+                    if (total > 0 && done < total) throw AbsException("Download interrupted. It will resume.")
+                    total
+                }
+            }
+            when {
+                result >= 0 -> return result
+                result == -1L && !refreshed -> {
+                    refreshTokens(auth)
+                    refreshed = true
+                }
+                result == -1L -> throw SignedOutException()
+                else -> Unit // -2: retry from zero
+            }
+        }
+        throw AbsException("Download failed.")
+    }
+
+    // ---- Playback --------------------------------------------------------------
+
+    /** Opens a server playback session, used to sync progress and listening time. */
+    suspend fun startPlayback(itemId: String): PlaybackSession {
+        val response = authed(HttpMethod.Post, "/api/items/$itemId/play") {
+            contentType(ContentType.Application.Json)
+            setBody(buildJsonObject {
+                put("mediaPlayer", "light-phone")
+                put("forceDirectPlay", true)
+                put("forceTranscode", false)
+                putJsonObject("deviceInfo") {
+                    put("clientName", "Light Phone")
+                    put("clientVersion", "0.1.0")
+                    put("manufacturer", "Light")
+                    put("model", "Light Phone III")
+                }
+            })
+        }
+        // Only used for syncing progress — audio plays from the download, so
+        // how the server would stream it (playMethod) doesn't matter.
+        return response.body<PlaybackSession>()
+    }
+
+    /**
+     * Reports listening to the server: [timeListenedSec] since the last sync,
+     * and the current position. Throws [SessionGoneException] on 404.
+     */
+    suspend fun syncSession(sessionId: String, currentTimeSec: Double, timeListenedSec: Double, durationSec: Double) {
+        val response = authed(HttpMethod.Post, "/api/session/$sessionId/sync", allow404 = true) {
+            contentType(ContentType.Application.Json)
+            setBody(buildJsonObject {
+                put("currentTime", currentTimeSec)
+                put("timeListened", timeListenedSec)
+                put("duration", durationSec)
+            })
+        }
+        if (response.status == HttpStatusCode.NotFound) throw SessionGoneException()
+    }
+
+    /** Closes a session, optionally with a final position sync. Never throws for 404. */
+    suspend fun closeSession(sessionId: String, final: FinalSync?) {
+        authed(HttpMethod.Post, "/api/session/$sessionId/close", allow404 = true) {
+            if (final != null) {
+                contentType(ContentType.Application.Json)
+                setBody(buildJsonObject {
+                    put("currentTime", final.currentTimeSec)
+                    put("timeListened", final.timeListenedSec)
+                    put("duration", final.durationSec)
+                })
+            }
+        }
+    }
+
+    data class FinalSync(val currentTimeSec: Double, val timeListenedSec: Double, val durationSec: Double)
+
+    /** Writes progress directly — the fallback when the session is gone. */
+    suspend fun patchProgress(itemId: String, currentTimeSec: Double, durationSec: Double) {
+        val finished = durationSec > 0 && durationSec - currentTimeSec <= 30
+        authed(HttpMethod.Patch, "/api/me/progress/$itemId", allow404 = true) {
+            contentType(ContentType.Application.Json)
+            setBody(buildJsonObject {
+                put("currentTime", currentTimeSec)
+                put("duration", durationSec)
+                put("progress", if (durationSec > 0) (currentTimeSec / durationSec).coerceIn(0.0, 1.0) else 0.0)
+                put("isFinished", finished)
+            })
+        }
+    }
+
+    // ---- Plumbing --------------------------------------------------------------
+
+    /**
+     * Sends an authenticated request. On 401 refreshes the access token once and
+     * retries; if the refresh itself is rejected the stored sign-in is cleared
+     * and [SignedOutException] is thrown. Other non-2xx statuses (except 404,
+     * which callers interpret) become an [AbsException].
+     */
+    private suspend fun authed(
+        method: HttpMethod,
+        path: String,
+        allow404: Boolean = false,
+        block: HttpRequestBuilder.() -> Unit = {},
+    ): HttpResponse {
+        val auth = AuthStore.current ?: throw SignedOutException()
+        var response = send(auth, method, path, block)
+        if (response.status == HttpStatusCode.Unauthorized) {
+            val refreshed = refreshTokens(auth)
+            response = send(refreshed, method, path, block)
+            if (response.status == HttpStatusCode.Unauthorized) {
+                AuthStore.clearIf(refreshed)
+                throw SignedOutException()
+            }
+        }
+        if (response.status == HttpStatusCode.NotFound && !allow404) {
+            throw AbsException("Not found on the server (it may have been removed).")
+        }
+        if (!response.status.isSuccess() && response.status != HttpStatusCode.NotFound) {
+            val detail = runCatching { response.bodyAsText().take(120) }.getOrDefault("")
+            throw AbsException("Server error (HTTP ${response.status.value}). $detail".trim())
+        }
+        return response
+    }
+
+    private suspend fun send(
+        auth: AuthState,
+        method: HttpMethod,
+        path: String,
+        block: HttpRequestBuilder.() -> Unit,
+    ): HttpResponse = network {
+        client.request("${auth.serverUrl}$path") {
+            this.method = method
+            header("Authorization", "Bearer ${auth.accessToken}")
+            block()
+        }
+    }
+
+    /** Exchanges the refresh token for new tokens. Concurrent callers share one refresh. */
+    internal suspend fun refreshTokens(stale: AuthState): AuthState = refreshLock.withLock {
+        val current = AuthStore.current ?: throw SignedOutException()
+        // Someone else already refreshed while we waited for the lock.
+        if (current.accessToken != stale.accessToken) return@withLock current
+        val refreshToken = current.refreshToken ?: run {
+            AuthStore.clearIf(current)
+            throw SignedOutException()
+        }
+        val response = network {
+            client.post("${current.serverUrl}/auth/refresh") {
+                header("x-refresh-token", refreshToken)
+                contentType(ContentType.Application.Json)
+                setBody("{}")
+            }
+        }
+        if (response.status == HttpStatusCode.Unauthorized || response.status == HttpStatusCode.Forbidden) {
+            AuthStore.clearIf(current)
+            throw SignedOutException()
+        }
+        if (!response.status.isSuccess()) {
+            // 5xx etc: transient. Keep the sign-in; the caller's request fails for now.
+            throw AbsException("Couldn't refresh sign-in (HTTP ${response.status.value}).")
+        }
+        val user = runCatching { response.body<LoginResponse>().user }.getOrNull()
+            ?: throw AbsException("Couldn't refresh sign-in: unexpected server response.")
+        val updated = current.copy(
+            accessToken = user.accessToken ?: user.token ?: current.accessToken,
+            refreshToken = user.refreshToken ?: current.refreshToken,
+        )
+        // Signed out (or into another account) while refreshing? Don't resurrect it.
+        if (!AuthStore.replaceIf(current, updated)) throw SignedOutException()
+        updated
+    }
+
+    /** Maps I/O failures to a message that makes sense on a phone. */
+    private suspend fun <T> network(call: suspend () -> T): T = try {
+        call()
+    } catch (e: io.ktor.client.plugins.HttpRequestTimeoutException) {
+        throw AbsException("The server took too long to respond.", e)
+    } catch (e: io.ktor.client.network.sockets.SocketTimeoutException) {
+        throw AbsException("The server took too long to respond.", e)
+    } catch (e: javax.net.ssl.SSLException) {
+        throw AbsException("Secure connection failed. If your server uses plain http, type http:// first.", e)
+    } catch (e: IOException) {
+        throw AbsException("Can't reach the server. Check the address and your connection.", e)
+    } catch (e: java.nio.channels.UnresolvedAddressException) {
+        throw AbsException("Can't find that server. Check the address.", e)
+    }
+}

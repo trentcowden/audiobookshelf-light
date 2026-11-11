@@ -74,9 +74,14 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":sdk:client"))
+    // sdk:client brings in Ktor (OkHttp engine), kotlinx-serialization and coroutines.
+    // sdk:ui bundles an ML Kit scanner + CameraX for the SDK's QR features; this tool
+    // never scans codes, so keep their native libraries out of the APK.
+    implementation(project(":sdk:client")) {
+        exclude(group = "com.google.mlkit")
+        exclude(group = "androidx.camera")
+    }
     testImplementation(libs.kotlin.test)
-    ksp(libs.androidx.room.compiler)
 }
 
 /**

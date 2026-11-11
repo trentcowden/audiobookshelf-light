@@ -1,73 +1,49 @@
-# light-sdk
-or: a tool for building Tools
+# Audiobookshelf for Light Phone
 
-## tl;dr
-This repository contains the scaffolding for building simple tools for the Light Phone III. Included are a library ([:sdk:client](./sdk/client)) and placeholder application ([:tool](./tool)) that depends on it. To create a tool that is fully compatible with LightOS, you must write your application code within the `tool` module, using the primitives provided by the sdk client library.
+A dead-simple [Audiobookshelf](https://www.audiobookshelf.org) client for the Light Phone III, built with the [light-sdk](https://github.com/lightphone/light-sdk). Download books from your own server, listen without worrying about signal, and keep your place in sync.
 
-You can and should use current Android best practices: Kotlin for all source code, Compose for UI, Coroutines for async programming, and MVVM architecture. **Although this is appears to be a fairly standard Android dev environment, you will quickly find out that we are (gently but broadly) restricting which Android APIs and third-party libraries can be used. This is in an effort to provide a secure and distinctly _light_ experience for our users. These restrictions are _not_ set in stone and should ease up over time. If there is a stable, open-source library that you'd like us to allow, please let us know! More on this later.**
+## Features
 
-## IMPORTANT!! July 1, 2026 Update
-If you're reading this, welcome! You're early! (in a cool way)
-This repo is a work-in-progress and will remain so for a while. Things are going to change _fast_ in the coming weeks. If you're going to start building right away, be sure to `git pull` frequently.
-Before you do, though, please be aware that **while we feel good about letting everybody start to explore and build, we are still working on the infrastructure to properly deploy your new tools.**
-The currently builds of LightOS in the wild are not yet ready to "play nice" with the tools built here. If you're someone who's already comfortable working with ADB to sideload APKs on your
-Light Phone III, you can totally do that with whatever you do here! But we're shooting to make these tools feel as seamless as the ones already available in LightOS, and that's going to take a bit more work. 
-We're hoping to have an update on that front later this month. In the meantime, the best way to start working is to use an Android emulator running our new [LightOS Emulator](sdk/emulator). The instructions for getting that up and running
-are [right here](docs/system_app).
+- Log in to your Audiobookshelf server (server address, username, password)
+- Library: **Continue** (books in progress) and **All Books**, with your progress and download status; works offline
+- Search by title, author, series or narrator
+- Books are **downloaded, then played from the phone**, so bad signal never interrupts listening. Downloads resume if interrupted
+- Player: play/pause, back/forward 15 seconds, a seek bar for the whole book (tap the times to switch it to the current chapter), "38% · 14h 2m left", chapter list, speed (0.75x–2x)
+- Keeps playing in the background
+- Progress is saved on the phone every few seconds and synced to the server every 15 seconds and when you pause. Offline listening is sent when you're back online. When phone and server disagree, the newer position wins.
+- After a pause longer than 5 minutes, resumes 15 seconds back so you can pick the thread up again
+- Settings: server, downloads storage, **Reset Player**, **Log Out**
 
-## Quickstart
+## Using it
 
-### Running your Tool
-**You can test your tool on any Android device or emulator**, but certain functionality (receiving push notifications, requesting special permissions) can only be tested with:
-A) Real Light Phone hardware running LightOS
-B) An Android emulator (on your computer) set up to run our LightOS emulator app as a _system app_ ([see advanced instructions](docs/system_app))
+1. Open the tool and enter your server address (e.g. `audiobooks.example.com`; `https://` is added for you, and plain `http://` is tried if that fails), your username and password.
+2. Tap a book, download it (keep the tool open while it downloads; the Light SDK can't download in the background yet), then play.
+3. Remove a download with the trash icon on the player. Your progress is kept.
 
-You can quickly [create an emulator](https://developer.android.com/studio/run/managing-avds) that generally feels like an LPIII by using the following settings:
-* 1080 X 1240, 3.92" display
-* Android API 34
-* NO Google Play Services installed
+The password is only used to log in and is never stored. The tool keeps the tokens the server returns, in its private storage. The Light keyboard can't hide what you type, so the password is visible while you enter it.
 
-### Start Building
-1. Fork and/or clone this repository into your local dev environment.
-2. Install Android Studio and open this project within it. (IntelliJ IDEA should also work)
+Offline listening updates your position but isn't counted in Audiobookshelf's listening stats.
 
-3. Edit the code in `HomeScreen` and `HomeScreenViewModel` to get started. `Homescreen` surfaces a `@Composable` method named `Content`. This is the UI that is shown when the tool first boots. You'll notice this UI sources data from it's `viewModel` field, which is an instance of `HomeScreenViewModel`. Edit that class with your screen's logic and expose the data to the UI using either Compose `State` or Coroutine `Flow`s. If you want to create a new screen, create a new Screen/ViewModel pair: your screen should extend from `LightScreen` and your VM from `LightScreenViewModel`. Your screen implementation will need:
-   1. A direct reference to your ViewModel's class type
-   2. A factory method for creating a new instance of your ViewModel.
+## If playback gets stuck
 
-Look at `HomeScreen` as an example for how this is done. To navigate to your new screen, use the `navigateTo` function built into `LightScreen` - just pass it a lambda to create an instance of your new screen. Note that the `LightScreen` constructor takes in a `SealedLightActivity`. The lambda is provided an instance of this as a default parameter.
+Settings → **Reset Player** stops playback and rebuilds the player. If the player still can't start, the tool closes itself so the next launch starts fresh (LightOS has no force-stop).
 
-Since LightOS does not use Android system navigation, we provide a back button for you. As long as you use `navigateTo` to move between screens, our back button should work great. If need be, you can override the `onBackPressed` method in your `LightViewModel`.
+Why this exists: in a Light SDK tool, if Android destroys the tool's screen while audio is playing, a player owned by a screen is never released. The SDK only allows one player per tool, so every later tap does nothing until the phone restarts. This tool owns its single player outside any screen, releases it when the screen goes away, checks that Play actually started (rebuilding the player and retrying once if it didn't), and shows an error instead of failing silently.
 
-### Submitting Your Tool
-Given our relatively limited resources and desire to keep our users safe, we're requiring that all community tools be open source (including our own!). 
-Tools are built and signed directly from a publicly available git commit, and we'll be archiving the source at build time.
-You're free to build and share privately, but LightOS won't let you install tools that are not signed by us without acknowledging privacy and performance risks.
-We won't block users from performing these "dangerous" sideloads, but we're not going to encourage it either. 
-Using the Dashboard, developers are able to queue up a build of your tool on our servers, and if it follows our guidelines and compiles cleanly, we will hand you back a signed, shareable APK.
+## Building
 
-1. Review the [Tool Guidelines](TOOL_GUIDELINES.md) to get a sense of the kind of tools we're hoping to showcase.
-2. Ensure your tool is built with the latest Light SDK version and is accessible via a public Github repo.
-  - Keep the [files the build server requires](docs/repo/README.md#required-files) when trimming the repo down to your tool.
-3. Enable developer mode on the [dashboard](https://dashboard.thelightphone.com/): Settings -> Account -> Developer Account.
-4. From there, you can create your tool: Settings -> Account -> Developer Account -> Manage Custom Tools -> Submit New Tool:
-  - The package name is unique for all tools and can't be changed later. It is pulled from the default branch of the Github repo submitted upon registering the tool.
-  - You'll then have the opportunity to add images. You can add them later on as well, but we'll require at least one for a tool to be approved.
-5. Now go in the tool detail page and press "submit build":
-  - Enter the git ref of the version of the tool to be built and a small description of the changelog.
-  - If your tool already has an active build, you won't be able to submit another.
-  - The `versionCode` of the submitted build should be higher than the one of the last version listed in the Tool page.
-6. Wait for the build to finish:
-  - In case of an error, use the "view details" button on the "Builds" section of the Tool page to check the error message. The "retry build" can be used to re-attempt building from the same git ref if necessary.
-  - If you believe the build error is due to an issue on our end (e.g. with light-sdk or our infrastructure), please feel free to open an Issue on this repo!
-  - In case of success, the "download apk" button should appear. A new "Version" entry will be created with "pending approval" status.
-7. Our team will review the builds and reach out to you via e-mail if we have any feedback regarding the approval process.
-8. If you have any questions, please e-mail us at tools@thelightphone.com
+Needs JDK 17 and 21 and the Android SDK (API 36). This repo is a fork of light-sdk; the tool is the `:tool` module.
 
-### Sharing Your Tool
-Once we release a version of LightOS that supports community tools, users will have an option to choose what kind of tools they want to be able to run on their device:
-- **Light-approved tools**: These include tools that are either built internally by the Light team, or built by the community and officially tested/signed-off by the Light team. We don't know _exactly_ what that sign-off process is going to look like, but as a heads-up: we're going to be looking pretty hard at whether a submitted tool matches the Light ethos both functionally and aesthetically. We've included a UX/UI library to make this as easy as possible! From a technical standpoint, these approved tools are both signed by us _and_ added to an "allow-list" within LightOS. Phones with this option selected will only install and display tools that meet both criteria.
-- **SDK-built tools**: This is a slightly more permissive choice. Phones with this option selected will install and launch any tool that was built and signed by Light. These don't require any manual approval by us (although we can block them in extreme cases). If a user wants to be able to install a tool that was shared locally or somewhere outside of Light's dashboard, but they still want to be confident that it will run well and integrate nicely with LightOS, they might choose this option.
-- **Any tools**: A user will have the option to make any APK launchable from LightOS, but they will own the responsibility of getting them installed/uninstalled. When a user selects this option, we will warn them that they are potentially opening their device up to security risks, and that doing so will limit our ability to support them if something goes wrong.
+```bash
+./gradlew :tool:assembleDebug -DlightSdk.toolOnly=true      # build
+./gradlew :tool:testDebugUnitTest -DlightSdk.toolOnly=true  # unit tests
+adb install -r tool/build/outputs/apk/debug/tool-debug.apk   # sideload
+```
 
-## [Complete Documentation](./docs)
+For the LightOS emulator, switch `serverPackage` in `tool/lighttool.toml` and build with `-DlightSdk.allowAltServerPackage=true`.
+
+## Credits
+
+The player design (detached audio, chapter seek bar, speed picker, rewind after a long pause) is adapted from [fenleon/audiobooks](https://github.com/fenleon/audiobooks) (MIT). The API usage follows the official [audiobookshelf-app](https://github.com/advplyr/audiobookshelf-app).
+
+Unofficial, not affiliated with Audiobookshelf or The Light Phone, Inc. The Light SDK's original README is [here](https://github.com/lightphone/light-sdk#readme).
