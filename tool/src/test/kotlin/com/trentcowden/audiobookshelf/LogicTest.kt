@@ -8,6 +8,7 @@ import com.trentcowden.audiobookshelf.screens.formatDuration
 import com.trentcowden.audiobookshelf.screens.formatSpeed
 import com.trentcowden.audiobookshelf.screens.BookRow
 import com.trentcowden.audiobookshelf.screens.searchBooks
+import com.trentcowden.audiobookshelf.screens.primarySeries
 import com.trentcowden.audiobookshelf.screens.formatTime
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -69,5 +70,16 @@ class LogicTest {
         assertEquals(listOf("b", "a"), searchBooks(ranked, "kings").map { it.id })
         assertEquals(listOf("4"), searchBooks(books, "miserables").map { it.id })
         assertEquals(emptyList(), searchBooks(books, "   ").map { it.id })
+    }
+
+    @Test
+    fun showsTheFirstSeries() {
+        assertEquals("Dune #1", primarySeries("Dune #1, The Dune Sequence #12"))
+        assertEquals("The Ender Saga #3", primarySeries("The Ender Saga #3, The Enderverse #13"))
+        assertEquals("Dungeon Crawler Carl #6", primarySeries("Dungeon Crawler Carl #6"))
+        assertEquals("Earth, Wind & Fire #2", primarySeries("Earth, Wind & Fire #2"))
+        assertEquals("Discworld", primarySeries("Discworld"))
+        assertEquals(null, primarySeries(""))
+        assertEquals(null, primarySeries(null))
     }
 }

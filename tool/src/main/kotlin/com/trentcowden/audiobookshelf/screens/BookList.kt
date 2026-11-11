@@ -74,6 +74,15 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
                         modifier = Modifier.padding(top = 0.2f.gridUnitsAsDp()),
                     )
                 }
+                primarySeries(row.series)?.let { series ->
+                    LightText(
+                        text = series,
+                        variant = LightTextVariant.Detail,
+                        lighten = true,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             val label = when {
                 row.finished -> "done"
@@ -93,6 +102,17 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
             LightProgressBar(colors = themeColors, progress = row.progress)
         }
     }
+}
+
+/**
+ * The first series of an ABS series list ("Dune #1, The Dune Sequence #12" →
+ * "Dune #1"). The listing joins several series with ", ", so split only where
+ * a ", " follows a "#number" — series names themselves may contain commas.
+ */
+fun primarySeries(seriesName: String?): String? {
+    val name = seriesName?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val boundary = Regex("""#[\d.]+, """).find(name) ?: return name
+    return name.substring(0, boundary.range.last - 1)
 }
 
 /** Short download status for a list row (collect [Downloads.states] once per screen). */
