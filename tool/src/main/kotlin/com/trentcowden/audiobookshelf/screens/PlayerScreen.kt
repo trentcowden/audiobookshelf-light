@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.em
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.ui.LightBarButton
@@ -102,6 +103,7 @@ class PlayerScreen(
                         variant = LightTextVariant.Heading,
                         align = TextAlign.Center,
                         maxLines = 3,
+                        lineHeight = 1.15.em, // wrapped titles read as one block
                         modifier = Modifier.fillMaxWidth(),
                     )
                     (live?.author ?: author)?.let {
@@ -109,7 +111,7 @@ class PlayerScreen(
                             text = it,
                             variant = LightTextVariant.Copy,
                             align = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth().padding(top = 0.25f.gridUnitsAsDp()),
+                            modifier = Modifier.fillMaxWidth().padding(top = 0.5f.gridUnitsAsDp()),
                         )
                     }
                 }

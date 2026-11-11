@@ -16,6 +16,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.em
 import com.thelightphone.sdk.ui.LightProgressBar
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
@@ -55,9 +57,23 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
     Column(modifier = Modifier.weight(1f)) {
         Row(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.weight(1f).alignByBaseline()) {
-                LightText(text = row.title, variant = LightTextVariant.Copy)
+                // Copy's 1.5× line height is made for single lines; a wrapped
+                // title should read as one block, with the author just below.
+                LightText(
+                    text = row.title,
+                    variant = LightTextVariant.Copy,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    lineHeight = 1.15.em,
+                )
                 val detail = listOfNotNull(row.author, downloadLabel).joinToString(" · ")
-                if (detail.isNotEmpty()) LightText(text = detail, variant = LightTextVariant.Detail)
+                if (detail.isNotEmpty()) {
+                    LightText(
+                        text = detail,
+                        variant = LightTextVariant.Detail,
+                        modifier = Modifier.padding(top = 0.2f.gridUnitsAsDp()),
+                    )
+                }
             }
             val label = when {
                 row.finished -> "done"
