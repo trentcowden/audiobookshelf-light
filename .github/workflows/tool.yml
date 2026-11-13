@@ -1,6 +1,11 @@
-name: PR Check
+name: Tool
+
+# Builds and tests the Audiobookshelf tool. Replaces light-sdk's own workflows, which release
+# the SDK itself and fail in a fork (they need Light's release secrets).
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -12,18 +17,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: Gradle check
+  build:
+    name: Test and build
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Release script tests
-        run: .github/scripts/tests/run.sh
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -39,5 +39,5 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run check
-        run: ./gradlew check --stacktrace
+      - name: Test, lint and build
+        run: ./gradlew :tool:testDebugUnitTest :tool:lintDebug :tool:assembleDebug -DlightSdk.toolOnly=true --stacktrace
