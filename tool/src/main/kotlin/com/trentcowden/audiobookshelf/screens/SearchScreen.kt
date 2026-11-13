@@ -11,12 +11,14 @@ import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightIcons
-import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import kotlinx.coroutines.flow.MutableStateFlow
 import com.trentcowden.audiobookshelf.downloads.Downloads
+import com.trentcowden.audiobookshelf.library.BookRow
+import com.trentcowden.audiobookshelf.library.searchBooks
+import androidx.compose.foundation.lazy.items
 
 class SearchViewModel(initialQuery: String) : LightViewModel<Unit>() {
     val query = MutableStateFlow(initialQuery)
@@ -57,10 +59,8 @@ class SearchScreen(
             )
             when {
                 results.isEmpty() -> CenteredMessage("No books match “$query”.")
-                else -> LightScrollView(
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                ) {
-                    results.forEach { row ->
+                else -> BookList(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    items(results, key = { it.id }) { row ->
                         BookListRow(row, downloads[row.id]) {
                             navigateTo(screenFactory = { PlayerScreen(it, row.id, row.title, row.author) })
                         }

@@ -1,5 +1,6 @@
 package com.trentcowden.audiobookshelf.screens
 
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -22,7 +23,6 @@ import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import com.trentcowden.audiobookshelf.api.Chapter
-import com.trentcowden.audiobookshelf.playback.SettingsStore
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlin.math.roundToInt
@@ -89,32 +89,46 @@ class ChaptersScreen(
     }
 }
 
-/** Playback speed picker; returns the chosen speed. */
-class SpeedScreen(sealedActivity: SealedLightActivity) :
-    AbsScreen<Float, PickerViewModel<Float>>(sealedActivity) {
+/** One option in a [ChoiceScreen]. */
+data class Choice<T : Any>(val label: String, val value: T, val detail: String? = null)
+
+/**
+ * A list of options in the stock Light style (large text, the current one
+ * underlined); returns the chosen value. Used for speed, sleep timer,
+ * library, sort and the book menu.
+ */
+class ChoiceScreen<T : Any>(
+    sealedActivity: SealedLightActivity,
+    private val title: String,
+    private val choices: List<Choice<T>>,
+    private val selected: T? = null,
+) : AbsScreen<T, PickerViewModel<T>>(sealedActivity) {
 
     @Suppress("UNCHECKED_CAST")
-    override val viewModelClass = PickerViewModel::class.java as Class<PickerViewModel<Float>>
-    override fun createViewModel() = PickerViewModel<Float>()
+    override val viewModelClass = PickerViewModel::class.java as Class<PickerViewModel<T>>
+    override fun createViewModel() = PickerViewModel<T>()
 
     @Composable
     override fun ScreenContent() {
-        val current = SettingsStore.speed
         AbsScreenScaffold {
-            BackTopBar(title = "Speed", onBack = { goBack() })
+            BackTopBar(title = title, onBack = { goBack() })
             LightScrollView(
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(start = 1f.gridUnitsAsDp()),
             ) {
-                SettingsStore.speeds.forEach { speed ->
-                    LightText(
-                        text = formatSpeed(speed),
-                        variant = LightTextVariant.Heading,
-                        underline = speed == current,
+                choices.forEach { choice ->
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .lightClickable { goBack(speed) }
+                            .lightClickable { goBack(choice.value) }
                             .padding(vertical = 0.75f.gridUnitsAsDp()),
-                    )
+                    ) {
+                        LightText(
+                            text = choice.label,
+                            variant = LightTextVariant.Heading,
+                            underline = choice.value == selected,
+                        )
+                        choice.detail?.let { LightText(text = it, variant = LightTextVariant.Detail) }
+                    }
                 }
             }
         }

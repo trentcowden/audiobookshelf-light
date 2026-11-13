@@ -30,6 +30,50 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import com.trentcowden.audiobookshelf.downloads.DownloadState
+import com.trentcowden.audiobookshelf.library.BookRow
+import com.trentcowden.audiobookshelf.library.primarySeries
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.platform.LocalDensity
+import com.thelightphone.sdk.ui.LightLazyScrollView
+
+/**
+ * A lazily composed list of books, so a library of thousands scrolls as
+ * smoothly as one of ten. The SDK's lazy list sizes its scroll bar from one
+ * item height; rows here vary (wrapped titles, series), so it gets the
+ * average height of the rows seen so far.
+ */
+@Composable
+fun BookList(modifier: Modifier = Modifier, content: LazyListScope.() -> Unit) {
+    val listState = rememberLazyListState()
+    val unitPx = with(LocalDensity.current) { 1f.gridUnitsAsDp().toPx() }
+    var averageHeight by remember { mutableFloatStateOf(INITIAL_ROW_HEIGHT) }
+    LaunchedEffect(listState, unitPx) {
+        val heights = mutableMapOf<Any, Int>()
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo.map { it.key to it.size } }.collect { visible ->
+            visible.forEach { (key, size) -> heights[key] = size }
+            if (heights.isNotEmpty()) {
+                val average = heights.values.average().toFloat() / unitPx
+                // Ignore tiny changes so the scroll bar doesn't twitch.
+                if (kotlin.math.abs(average - averageHeight) > averageHeight * 0.02f) averageHeight = average
+            }
+        }
+    }
+    LightLazyScrollView(
+        modifier = modifier,
+        listState = listState,
+        uniformItemHeightGridUnits = averageHeight,
+        content = content,
+    )
+}
+
+/** Starting guess for a row's height (grid units) until real rows are measured. */
+private const val INITIAL_ROW_HEIGHT = 4f
 
 /** A book in a list: title, author, and how far through it you are. */
 @Composable
@@ -117,17 +161,6 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
     }
 }
 
-/**
- * The first series of an ABS series list ("Dune #1, The Dune Sequence #12" →
- * "Dune #1"). The listing joins several series with ", ", so split only where
- * a ", " follows a "#number" — series names themselves may contain commas.
- */
-fun primarySeries(seriesName: String?): String? {
-    val name = seriesName?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-    val boundary = Regex("""#[\d.]+, """).find(name) ?: return name
-    return name.substring(0, boundary.range.last - 1)
-}
-
 /** Short download status for a list row (collect [Downloads.states] once per screen). */
 fun downloadLabel(state: DownloadState?): String? = when (state) {
     is DownloadState.Done -> null // shown as an icon in the left margin
@@ -137,28 +170,3 @@ fun downloadLabel(state: DownloadState?): String? = when (state) {
     is DownloadState.Failed -> "download paused"
     null -> null
 }
-
-/**
- * Every word of the query must appear somewhere in the title, author, series
- * or narrator (case- and accent-insensitive). Title matches sort first.
- */
-fun searchBooks(books: List<BookRow>, query: String): List<BookRow> {
-    val words = normalize(query).split(' ').filter { it.isNotBlank() }
-    if (words.isEmpty()) return emptyList()
-    return books
-        .map { book ->
-            val title = normalize(book.title)
-            val haystack = listOfNotNull(title, book.author, book.series, book.narrator)
-                .joinToString(" ") { normalize(it) }
-            book to (words.all { haystack.contains(it) } to words.all { title.contains(it) })
-        }
-        .filter { (_, match) -> match.first }
-        .sortedByDescending { (_, match) -> match.second }
-        .map { it.first }
-}
-
-private fun normalize(text: String): String =
-    java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFD)
-        .replace(Regex("\\p{M}+"), "")
-        .lowercase()
-        .replace(Regex("[^a-z0-9 ]+"), " ")

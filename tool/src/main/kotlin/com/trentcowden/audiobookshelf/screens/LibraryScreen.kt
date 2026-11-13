@@ -1,8 +1,7 @@
 package com.trentcowden.audiobookshelf.screens
 
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -18,46 +17,37 @@ import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
-import com.thelightphone.sdk.ui.LightProgressBar
-import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
-import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.gridUnitsAsDp
-import com.thelightphone.sdk.ui.lightClickable
 import com.trentcowden.audiobookshelf.AppInit
 import com.trentcowden.audiobookshelf.api.AbsApi
 import com.trentcowden.audiobookshelf.api.AbsException
-import com.trentcowden.audiobookshelf.api.AuthStore
-import com.trentcowden.audiobookshelf.api.LibraryItem
-import com.trentcowden.audiobookshelf.api.MediaProgress
 import com.trentcowden.audiobookshelf.api.SignedOutException
-import com.trentcowden.audiobookshelf.playback.Playback
-import com.trentcowden.audiobookshelf.downloads.CachedLibrary
 import com.trentcowden.audiobookshelf.downloads.Downloads
-import com.trentcowden.audiobookshelf.downloads.DownloadState
-import com.trentcowden.audiobookshelf.downloads.LibraryCache
-import com.trentcowden.audiobookshelf.downloads.LocalProgress
+import com.trentcowden.audiobookshelf.library.BookRow
+import com.trentcowden.audiobookshelf.library.bookRow
+import com.trentcowden.audiobookshelf.library.isListenable
+import com.trentcowden.audiobookshelf.library.sortBooks
+import com.trentcowden.audiobookshelf.library.toCatalogBook
+import com.trentcowden.audiobookshelf.playback.Playback
+import com.trentcowden.audiobookshelf.storage.AuthStore
+import com.trentcowden.audiobookshelf.storage.CachedLibrary
+import com.trentcowden.audiobookshelf.storage.LibraryCache
+import com.trentcowden.audiobookshelf.storage.LocalProgress
+import com.trentcowden.audiobookshelf.storage.Settings
+import com.trentcowden.audiobookshelf.storage.SettingsStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-/** One row in the library list. */
-data class BookRow(
-    val id: String,
-    val title: String,
-    val author: String?,
-    /** 0..1, or null when never started. */
-    val progress: Float?,
-    val finished: Boolean,
-    val series: String? = null,
-    val narrator: String? = null,
-)
 
 data class LibraryUiState(
     val signedIn: Boolean = false,
@@ -65,13 +55,16 @@ data class LibraryUiState(
     val error: String? = null,
     val continueListening: List<BookRow> = emptyList(),
     val allBooks: List<BookRow> = emptyList(),
+    /** Heading for the full list: "All Books", or the chosen library's name. */
+    val allBooksLabel: String = "All Books",
     val loadedOnce: Boolean = false,
 )
 
 class LibraryViewModel : LightViewModel<Unit>() {
     /** The full catalog is reloaded at most this often; progress refreshes on every show. */
     private var lastFullLoadAt = 0L
-    private var catalog: List<LibraryItem> = emptyList()
+    private var library = LibraryCache.load() ?: CachedLibrary()
+    private var rowsJob: Job? = null
 
     private val _ui = MutableStateFlow(LibraryUiState(signedIn = AuthStore.current != null))
     val ui = _ui.asStateFlow()
@@ -81,16 +74,9 @@ class LibraryViewModel : LightViewModel<Unit>() {
 
     init {
         // Show the last listing straight away (and with no signal at all).
-        LibraryCache.load()?.let { cached ->
-            catalog = cached.books
-            _ui.update {
-                it.copy(
-                    loadedOnce = cached.books.isNotEmpty(),
-                    continueListening = cached.inProgress.map { item -> item.toRow(cached.progress) },
-                    allBooks = cached.books.map { item -> item.toRow(cached.progress) },
-                )
-            }
-        }
+        if (library.books.isNotEmpty()) publishRows(loadedOnce = true)
+        // A different library or sort order re-sorts what's already loaded.
+        viewModelScope.launch { SettingsStore.settings.drop(1).collect { publishRows() } }
     }
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
@@ -101,53 +87,29 @@ class LibraryViewModel : LightViewModel<Unit>() {
 
     fun refresh(force: Boolean = false) {
         val signedIn = AuthStore.current != null
-        _ui.update { it.copy(signedIn = signedIn) }
         if (!signedIn) {
             // Signed out: forget the previous account's books.
-            catalog = emptyList()
+            library = CachedLibrary()
             lastFullLoadAt = 0
-            _ui.update { LibraryUiState(signedIn = false) }
+            _ui.value = LibraryUiState(signedIn = false)
             return
         }
+        _ui.update { it.copy(signedIn = true) }
         if (_ui.value.loading) return
-        val fullLoad = force || catalog.isEmpty() ||
+        val fullLoad = force || library.books.isEmpty() ||
             System.currentTimeMillis() - lastFullLoadAt > CATALOG_MAX_AGE_MS
         _ui.update { it.copy(loading = true) }
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    coroutineScope {
-                        val inProgress = async { AbsApi.itemsInProgress() }
-                        val progress = async { AbsApi.mediaProgress() }
-                        val books = if (fullLoad) {
-                            AbsApi.bookLibraries().flatMap { AbsApi.allBooks(it.id) }
-                        } else {
-                            catalog
-                        }
-                        Triple(inProgress.await(), progress.await(), books)
-                    }
-                }
-            }
+            val result = withContext(Dispatchers.IO) { runCatching { fetch(fullLoad) } }
             result.fold(
-                onSuccess = { (inProgress, progress, books) ->
-                    if (fullLoad) {
-                        catalog = books
-                        lastFullLoadAt = System.currentTimeMillis()
-                    }
-                    withContext(Dispatchers.IO) {
-                        LibraryCache.save(CachedLibrary(books, inProgress, progress, System.currentTimeMillis()))
-                    }
+                onSuccess = { fetched ->
+                    if (fullLoad) lastFullLoadAt = System.currentTimeMillis()
+                    library = fetched
+                    withContext(Dispatchers.IO) { LibraryCache.save(fetched) }
                     // Online again: send positions from offline listening.
                     Playback.flushOfflineProgress()
-                    _ui.update {
-                        it.copy(
-                            loading = false,
-                            error = null,
-                            loadedOnce = true,
-                            continueListening = inProgress.map { item -> item.toRow(progress) },
-                            allBooks = books.map { item -> item.toRow(progress) },
-                        )
-                    }
+                    _ui.update { it.copy(loading = false, error = null) }
+                    publishRows(loadedOnce = true)
                 },
                 onFailure = { e ->
                     _ui.update {
@@ -166,24 +128,57 @@ class LibraryViewModel : LightViewModel<Unit>() {
         }
     }
 
-    private companion object {
-        const val CATALOG_MAX_AGE_MS = 10 * 60_000L
+    /** Progress always; the whole catalog only when [fullLoad]. */
+    private suspend fun fetch(fullLoad: Boolean): CachedLibrary = coroutineScope {
+        val inProgress = async { AbsApi.itemsInProgress() }
+        val progress = async { AbsApi.mediaProgress() }
+        val (libraries, books) = if (fullLoad) {
+            val libraries = AbsApi.bookLibraries()
+            val books = libraries.map { lib -> async { AbsApi.allItems(lib.id) } }.awaitAll()
+                .flatten()
+                .filter { it.isListenable() }
+                .map { it.toCatalogBook() }
+            libraries to books
+        } else {
+            library.libraries to library.books
+        }
+        CachedLibrary(
+            libraries = libraries,
+            books = books,
+            inProgressIds = inProgress.await().map { it.id },
+            progress = progress.await(),
+            savedAt = System.currentTimeMillis(),
+        )
     }
 
-    private fun LibraryItem.toRow(progress: Map<String, MediaProgress>): BookRow {
-        val p = progress[id]
-        // Listening on this phone may be ahead of the server (offline).
-        val local = LocalProgress.get(id)?.takeIf { l -> p == null || l.updatedAt > p.lastUpdate }
-        val localFraction = local?.takeIf { it.durationSec > 0 }?.let { (it.positionSec / it.durationSec).toFloat() }
-        return BookRow(
-            id = id,
-            title = media.metadata.title ?: "Untitled",
-            author = media.metadata.authorName?.takeIf { it.isNotBlank() },
-            progress = (localFraction ?: p?.progress?.toFloat())?.takeIf { it > 0f },
-            finished = p?.isFinished == true,
-            series = media.metadata.seriesName?.takeIf { it.isNotBlank() },
-            narrator = media.metadata.narratorName?.takeIf { it.isNotBlank() },
-        )
+    /** Builds the rows for the chosen library and sort order, off the main thread. */
+    private fun publishRows(loadedOnce: Boolean = _ui.value.loadedOnce) {
+        val snapshot = library
+        val settings = SettingsStore.settings.value
+        rowsJob?.cancel()
+        rowsJob = viewModelScope.launch {
+            val (continueRows, allRows, label) = withContext(Dispatchers.Default) { buildRows(snapshot, settings) }
+            _ui.update {
+                it.copy(continueListening = continueRows, allBooks = allRows, allBooksLabel = label, loadedOnce = loadedOnce)
+            }
+        }
+    }
+
+    private fun buildRows(lib: CachedLibrary, settings: Settings): Triple<List<BookRow>, List<BookRow>, String> {
+        // A library that's gone from the server falls back to all of them.
+        val chosen = lib.libraries.firstOrNull { it.id == settings.libraryId }
+        val books = if (chosen == null) lib.books else lib.books.filter { it.libraryId == chosen.id }
+        val byId = books.associateBy { it.id }
+        fun row(book: com.trentcowden.audiobookshelf.library.CatalogBook) =
+            bookRow(book, lib.progress[book.id], LocalProgress.get(book.id))
+        val continueRows = lib.inProgressIds.mapNotNull { byId[it] }.map(::row)
+        val allRows = sortBooks(books, settings.sort).map(::row)
+        val label = if (chosen != null && lib.libraries.size > 1) chosen.name else "All Books"
+        return Triple(continueRows, allRows, label)
+    }
+
+    private companion object {
+        const val CATALOG_MAX_AGE_MS = 10 * 60_000L
     }
 }
 
@@ -218,26 +213,24 @@ class LibraryScreen(sealedActivity: SealedLightActivity) :
                 !ui.signedIn -> CenteredMessage("Sign in to your Audiobookshelf server to see your books.")
                 !ui.loadedOnce && ui.loading -> CenteredMessage("Loading your library…")
                 !ui.loadedOnce && ui.error != null -> CenteredMessage(ui.error!!)
-                ui.allBooks.isEmpty() -> CenteredMessage("No books in your library yet.")
-                else -> LightScrollView(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
-                ) {
-                    if (ui.error != null) {
-                        LightText(
-                            text = ui.error!!,
-                            variant = LightTextVariant.Detail,
-                            modifier = Modifier.padding(start = LIST_GUTTER.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp()),
-                        )
+                ui.allBooks.isEmpty() && !ui.loadedOnce -> CenteredMessage("Loading your library…")
+                ui.allBooks.isEmpty() -> CenteredMessage("No audiobooks in this library yet.")
+                else -> BookList(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    ui.error?.let { error ->
+                        item(key = "error") {
+                            LightText(
+                                text = error,
+                                variant = LightTextVariant.Detail,
+                                modifier = Modifier.padding(start = LIST_GUTTER.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp()),
+                            )
+                        }
                     }
                     if (ui.continueListening.isNotEmpty()) {
-                        SectionLabel("Continue")
-                        ui.continueListening.forEach { Book(it, downloads) }
-                        Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                        SectionLabel("All Books")
+                        item(key = "continue") { SectionLabel("Continue") }
+                        items(ui.continueListening, key = { "c-${it.id}" }) { Book(it, downloads[it.id]) }
+                        item(key = "all") { SectionLabel(ui.allBooksLabel, top = 1f) }
                     }
-                    ui.allBooks.forEach { Book(it, downloads) }
+                    items(ui.allBooks, key = { "a-${it.id}" }) { Book(it, downloads[it.id]) }
                 }
             }
             LightBottomBar(
@@ -263,8 +256,7 @@ class LibraryScreen(sealedActivity: SealedLightActivity) :
                             contentDescription = "Search",
                         )
                     } else {
-                        // Balancing spacer: keeps the middle button centered.
-                        null
+                        null // keeps the middle button centered
                     },
                 ),
             )
@@ -272,18 +264,22 @@ class LibraryScreen(sealedActivity: SealedLightActivity) :
     }
 
     @Composable
-    private fun SectionLabel(text: String) {
+    private fun SectionLabel(text: String, top: Float = 0f) {
         LightText(
             text = text,
             variant = LightTextVariant.Detail,
             lighten = true,
-            modifier = Modifier.padding(start = LIST_GUTTER.gridUnitsAsDp(), bottom = 0.5f.gridUnitsAsDp()),
+            modifier = Modifier.padding(
+                start = LIST_GUTTER.gridUnitsAsDp(),
+                top = top.gridUnitsAsDp(),
+                bottom = 0.5f.gridUnitsAsDp(),
+            ),
         )
     }
 
     @Composable
-    private fun Book(row: BookRow, downloads: Map<String, DownloadState>) {
-        BookListRow(row, downloads[row.id]) { openPlayer(row.id, row.title, row.author) }
+    private fun Book(row: BookRow, download: com.trentcowden.audiobookshelf.downloads.DownloadState?) {
+        BookListRow(row, download) { openPlayer(row.id, row.title, row.author) }
     }
 
     private fun openPlayer(id: String, title: String, author: String?) {

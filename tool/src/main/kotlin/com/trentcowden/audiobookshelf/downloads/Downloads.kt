@@ -3,6 +3,9 @@ package com.trentcowden.audiobookshelf.downloads
 import com.trentcowden.audiobookshelf.api.AbsApi
 import com.trentcowden.audiobookshelf.api.AbsException
 import com.trentcowden.audiobookshelf.api.Chapter
+import com.trentcowden.audiobookshelf.api.ItemDetails
+import com.trentcowden.audiobookshelf.api.PermanentDownloadException
+import com.trentcowden.audiobookshelf.storage.VersionedJsonFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -18,7 +21,6 @@ import kotlinx.coroutines.ensureActive
 import com.trentcowden.audiobookshelf.api.SignedOutException
 import kotlin.coroutines.coroutineContext
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import java.io.File
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -55,6 +57,34 @@ sealed interface DownloadState {
 }
 
 /**
+ * The manifest for a book's download: its tracks in play order, each with a
+ * stable file name, positioned on the book's timeline. Multi-file books
+ * (a folder of mp3s) get one track per file.
+ */
+fun manifestFrom(details: ItemDetails, fallbackTitle: String, fallbackAuthor: String?): DownloadedBook {
+    val tracks = details.media.tracks.sortedBy { it.index }.map { t ->
+        val ext = t.metadata.ext?.takeIf { e -> e.length in 2..6 && e[0] == '.' && e.drop(1).all { it.isLetterOrDigit() } }
+        DownloadedTrack(
+            index = t.index,
+            ino = t.ino,
+            startOffset = t.startOffset,
+            duration = t.duration,
+            fileName = "${t.index}${ext ?: ".audio"}",
+            bytes = t.metadata.size,
+        )
+    }
+    if (tracks.isEmpty()) throw PermanentDownloadException("This book has no audio.")
+    return DownloadedBook(
+        itemId = details.id,
+        title = details.media.metadata.title ?: fallbackTitle,
+        author = details.media.metadata.authorName ?: fallbackAuthor,
+        durationSec = details.media.duration.takeIf { it > 0 } ?: tracks.sumOf { it.duration },
+        chapters = details.media.chapters,
+        tracks = tracks,
+    )
+}
+
+/**
  * Downloads books into the tool's private storage, one at a time. Lives for the
  * whole process, so leaving a screen doesn't stop a download.
  *
@@ -64,13 +94,10 @@ sealed interface DownloadState {
  * lost when the phone freezes or kills the tool — [resumeUnfinished] picks it
  * back up next time.
  */
-/** A download problem that retrying won't fix (no space, no audio). */
-class PermanentDownloadException(message: String) : AbsException(message)
-
 object Downloads {
     const val PAUSED = "Paused"
     private const val MAX_ATTEMPTS = 4
-    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private const val MANIFEST_VERSION = 1
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var root: File? = null
 
@@ -198,28 +225,8 @@ object Downloads {
     private suspend fun fetch(itemId: String, title: String, author: String?): DownloadedBook {
         val dir = bookDir(itemId).also { it.mkdirs() }
         // Reuse a manifest from an interrupted attempt so file names stay put.
-        val book = readManifest(dir)?.takeIf { it.tracks.isNotEmpty() } ?: run {
-            val details = AbsApi.itemDetails(itemId)
-            val tracks = details.media.tracks.sortedBy { it.index }.map { t ->
-                DownloadedTrack(
-                    index = t.index,
-                    ino = t.ino,
-                    startOffset = t.startOffset,
-                    duration = t.duration,
-                    fileName = "${t.index}${t.metadata.ext?.takeIf { it.startsWith('.') } ?: ".audio"}",
-                    bytes = t.metadata.size,
-                )
-            }
-            if (tracks.isEmpty()) throw PermanentDownloadException("This book has no audio.")
-            DownloadedBook(
-                itemId = itemId,
-                title = details.media.metadata.title ?: title,
-                author = details.media.metadata.authorName ?: author,
-                durationSec = details.media.duration,
-                chapters = details.media.chapters,
-                tracks = tracks,
-            ).also { writeManifest(dir, it) }
-        }
+        val book = readManifest(dir)?.takeIf { it.tracks.isNotEmpty() }
+            ?: manifestFrom(AbsApi.itemDetails(itemId), title, author).also { writeManifest(dir, it) }
         val needed = book.tracks.sumOf { t -> (t.bytes - partOrFile(dir, t).length()).coerceAtLeast(0) }
         if (dir.usableSpace < needed + 200L * 1024 * 1024) {
             throw PermanentDownloadException("Not enough space on the phone for this book.")
@@ -256,18 +263,14 @@ object Downloads {
     private fun bookDir(itemId: String): File =
         File(root ?: error("Downloads not initialized"), itemId.replace(Regex("[^A-Za-z0-9_-]"), "_"))
 
-    private fun readManifest(dir: File): DownloadedBook? =
-        File(dir, "book.json").takeIf { it.isFile }?.let { f ->
-            runCatching { json.decodeFromString<DownloadedBook>(f.readText()) }.getOrNull()
+    private fun manifestFile(dir: File) =
+        VersionedJsonFile(File(dir, "book.json"), DownloadedBook.serializer(), MANIFEST_VERSION) { from, data ->
+            if (from == 0) data else null // v0: same shape, no envelope
         }
 
+    private fun readManifest(dir: File): DownloadedBook? = manifestFile(dir).read()
+
     private fun writeManifest(dir: File, book: DownloadedBook) {
-        val target = File(dir, "book.json")
-        val tmp = File(dir, "book.json.tmp")
-        tmp.writeText(json.encodeToString(DownloadedBook.serializer(), book))
-        if (!tmp.renameTo(target)) {
-            target.delete()
-            tmp.renameTo(target)
-        }
+        if (!manifestFile(dir).write(book)) throw AbsException("Couldn't save the download.")
     }
 }

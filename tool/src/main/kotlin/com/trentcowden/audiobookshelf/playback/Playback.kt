@@ -2,23 +2,19 @@ package com.trentcowden.audiobookshelf.playback
 
 import com.thelightphone.sdk.audio.LightAudio
 import com.thelightphone.sdk.audio.LightAudioItem
-import com.thelightphone.sdk.audio.LightAudioPlayback
 import com.thelightphone.sdk.audio.LightAudioPlayer
-import com.thelightphone.sdk.audio.LightAudioPlayerAvailability
 import com.thelightphone.sdk.audio.LightAudioSource
-import com.thelightphone.sdk.audio.LightAudioUsage
 import com.thelightphone.sdk.audio.LightMediaMetadata
-import com.thelightphone.sdk.audio.LightPlayerSpec
 import com.thelightphone.sdk.audio.NO_MEDIA_ITEM
 import com.trentcowden.audiobookshelf.api.AbsApi
-import com.trentcowden.audiobookshelf.api.AuthStore
+import com.trentcowden.audiobookshelf.api.AbsException
 import com.trentcowden.audiobookshelf.api.Chapter
-import com.trentcowden.audiobookshelf.api.PlaybackSession
-import com.trentcowden.audiobookshelf.api.SessionGoneException
 import com.trentcowden.audiobookshelf.downloads.DownloadedBook
 import com.trentcowden.audiobookshelf.downloads.Downloads
-import com.trentcowden.audiobookshelf.downloads.LibraryCache
-import com.trentcowden.audiobookshelf.downloads.LocalProgress
+import com.trentcowden.audiobookshelf.storage.AuthStore
+import com.trentcowden.audiobookshelf.storage.LibraryCache
+import com.trentcowden.audiobookshelf.storage.LocalProgress
+import com.trentcowden.audiobookshelf.storage.SettingsStore
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -29,7 +25,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -38,7 +33,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** What the player UI renders. Times are milliseconds on the book's global timeline. */
+/** What the player UI renders. Times are milliseconds on the book's timeline. */
 data class NowPlaying(
     val itemId: String,
     val title: String,
@@ -49,65 +44,41 @@ data class NowPlaying(
     val chapters: List<Chapter>,
     /** True while the book is being opened or the player is (re)connecting. */
     val loading: Boolean = false,
-    /** True when the server can't be reached; progress is kept on the phone until it can. */
-    val offline: Boolean = false,
 )
 
+/** Pauses playback after a while. */
+sealed interface SleepTimer {
+    /** [remainingMs] of playing time left (it doesn't count down while paused). */
+    data class Countdown(val remainingMs: Long) : SleepTimer
+
+    /** Pause when playback reaches [endMs] (the end of the chapter it was set in). */
+    data class EndOfChapter(val endMs: Long) : SleepTimer
+}
+
 /**
- * The tool's single audio player, shared by every screen and alive for the
- * whole process — **not** owned by a screen's view model.
+ * The tool's player, shared by every screen and alive for the whole process
+ * — never owned by a screen (see [PlayerSlot] for why that matters).
  *
- * Why: the SDK allows one detached player handle per process, and a handle
- * that is never released holds that slot (and keeps the playback service and
- * process alive) forever. fenleon's Audiobooks kept the handle in the Player
- * screen's view model; LightActivity has no onDestroy, so when Android tears
- * the activity down the view model is never cleared, the handle leaks, every
- * later `newPlayer()` throws, and every tap silently does nothing until the
- * phone reboots. Here:
+ * It ties together the audio handle ([PlayerSlot]), progress syncing
+ * ([ProgressSync]) and the downloaded book: commands from the UI, mapping
+ * multi-file books onto one timeline, play verification, and the sleep timer.
+ * Books play only from downloads.
  *
- * - exactly one handle exists, owned by this object, created on demand;
- * - it is released when the activity goes away ([onActivityGone]), so it
- *   never outlives the activity it was bound through (see light-sdk #299);
- * - it is re-checked before every use and rebuilt when it's dead;
- * - a Play that doesn't start within a few seconds rebuilds the player and
- *   retries once, then shows an error instead of doing nothing;
- * - [reset] is a user-visible escape hatch that tears everything down.
- *
- * Books play only from downloads. Progress is saved on the phone every few
- * seconds and synced to Audiobookshelf through a playback session whenever
- * the server is reachable (every [SYNC_INTERVAL_MS] while playing, on pause,
- * and when switching books). Offline, it waits on the phone and is pushed
- * when the connection comes back — unless the server has something newer.
+ * Everything that touches the handle, the book or the session runs on the
+ * main thread under [lock].
  */
 object Playback {
-    private const val SYNC_INTERVAL_MS = 15_000L
-    private const val LOCAL_SAVE_INTERVAL_MS = 5_000L
-    private const val RECONNECT_INTERVAL_MS = 60_000L
-    private const val READY_TIMEOUT_MS = 4_000L
-    private const val PLAY_START_TIMEOUT_MS = 6_000L
-    private const val REWIND_AFTER_PAUSE_MS = 5 * 60_000L
-    private const val REWIND_MS = 15_000L
-    private const val END_EPSILON_MS = 2_000L
     private const val SEEK_DEBOUNCE_MS = 300L
-    private const val NETWORK_TIMEOUT_MS = 8_000L
+    /** How long the player may take to report a new position after a seek. */
+    private const val SEEK_SETTLE_MS = 2_000L
+    /** Close enough: the player has caught up with a seek. */
+    private const val SEEK_TOLERANCE_MS = 1_500L
     /** Resuming after a pause this long first checks whether another device moved on. */
     private const val CHECK_SERVER_AFTER_PAUSE_MS = 60_000L
     private const val RESUME_CHECK_TIMEOUT_MS = 4_000L
-
-    /**
-     * Speech, so the lock screen and headset buttons get seek back/forward
-     * (Music would get previous/next track instead — useless for a one-file
-     * audiobook).
-     */
-    private val PLAYER_SPEC = LightPlayerSpec(usage = LightAudioUsage.Speech, playback = LightAudioPlayback.Detached)
-
-    /**
-     * Fallback when the SDK refuses [PLAYER_SPEC]: if a headset button revived
-     * the playback service by itself, it comes back as Music, and a detached
-     * session can't change usage until it ends. Playing as Music beats not
-     * playing at all.
-     */
-    private val FALLBACK_SPEC = LightPlayerSpec(usage = LightAudioUsage.Music, playback = LightAudioPlayback.Detached)
+    /** A server position this far from ours is a real jump (another device), not drift. */
+    private const val SERVER_JUMP_MS = 3_000L
+    private const val LOOP_INTERVAL_MS = 1_000L
 
     /**
      * Anything unexpected (e.g. a command racing a released handle, which the
@@ -115,16 +86,13 @@ object Playback {
      * never a crash, and never a silently dead player.
      */
     private val crashGuard = CoroutineExceptionHandler { _, e ->
-        android.util.Log.e("AbsPlayback", "playback error", e)
+        runCatching { android.util.Log.e("AbsPlayback", "playback error", e) }
         _error.value = "Player error: ${e.message ?: e.toString()}. Tap play to retry."
         _state.update { it?.copy(loading = false) }
-        observation?.cancel()
-        observation = null
-        handle?.let { h -> handle = null; runCatching { h.release() } }
+        slot.drop()
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + crashGuard)
-    /** Serializes everything that touches the handle, the book or the session. */
     private val lock = Mutex()
 
     private val _state = MutableStateFlow<NowPlaying?>(null)
@@ -137,192 +105,117 @@ object Playback {
     private val _speed = MutableStateFlow(1f)
     val speed: StateFlow<Float> = _speed.asStateFlow()
 
-    // ---- Handle --------------------------------------------------------------
+    private val _sleepTimer = MutableStateFlow<SleepTimer?>(null)
+    val sleepTimer: StateFlow<SleepTimer?> = _sleepTimer.asStateFlow()
 
-    private var audio: LightAudio? = null
-    /** Which activity [audio] belongs to (see ActivityWatch). */
-    private var audioGeneration = -1
-    private var handle: LightAudioPlayer? = null
-    /** Which activity [handle] was created through. */
-    private var handleGeneration = -1
-    private var observation: Job? = null
-    private var seekJob: Job? = null
-
-    // ---- Book & server session ------------------------------------------------
+    private val slot: PlayerSlot = PlayerSlot(scope, SlotEvents, speed = { _speed.value })
+    private val sync: ProgressSync = ProgressSync(AbsApi, LocalProgress, scope, Dispatchers.IO)
 
     /** The downloaded book loaded on the player. */
     private var book: DownloadedBook? = null
-    /** Server playback session used for syncing; null while offline. */
-    private var session: PlaybackSession? = null
-    /** The server dropped the session; sync by writing progress directly. */
-    private var sessionStale = false
+    /** A seek waiting for the track's duration (the SDK clamps seeks to the known duration). */
     private var pendingSeekWithinTrackMs: Long? = null
-    private var listenedMsSinceSync = 0L
-    private var lastTickAt = 0L
-    private var lastSyncAt = 0L
-    private var lastLocalSaveAt = 0L
-    /** Position written by the last [saveLocal]; unchanged positions aren't re-saved. */
-    private var lastSavedPositionMs = -1L
-    private var lastReconnectAt = 0L
     private var pausedAt = 0L
-    private var syncJob: Job? = null
+    private var seekJob: Job? = null
+    /** A seek is settling until then: a brief stop while it buffers isn't a pause. */
+    private var seekingUntil = 0L
+    private var pendingPause: Job? = null
+    private var loopJob: Job? = null
+
+    // ---- Activity lifecycle ------------------------------------------------------
 
     /**
      * Called by every screen when it shows. Remembers how to build a player
      * from the current activity; reconnects to live playback if a book is loaded.
      */
     fun attach(lightAudio: LightAudio, generation: Int) {
-        audio = lightAudio
-        audioGeneration = generation
-        _speed.value = SettingsStore.speed
-        val staleHandle = handle != null && handleGeneration != generation
-        if (staleHandle || (book != null && handle == null)) {
+        slot.attach(lightAudio, generation)
+        _speed.value = SettingsStore.settings.value.speed
+        if (slot.holdsStaleHandle || (book != null && slot.current == null)) {
             scope.launch {
                 lock.withLock {
                     // Never reuse a handle bound through a previous activity.
-                    if (handle != null && handleGeneration != audioGeneration) dropHandle()
-                    if (book != null) ensureHandle()
+                    if (slot.holdsStaleHandle) slot.drop()
+                    if (book != null) slot.ensure()
                 }
             }
         }
     }
 
-    /**
-     * The activity is being destroyed. Release the handle *now*, while its
-     * binding is still valid — detached playback carries on in the SDK's
-     * service, and the next activity reconnects with a fresh handle.
-     */
+    /** The activity is being destroyed: let go of the handle now (see [PlayerSlot.onActivityGone]). */
     fun onActivityGone(generation: Int) {
-        if (generation == audioGeneration) audio = null
-        // A newer activity already owns the player — nothing of ours to release.
-        if (generation != handleGeneration) return
-        val h = handle ?: return
         // Capture where we are before the handle goes.
-        refreshFromHandle(h)
-        observation?.cancel()
-        observation = null
-        handle = null
-        runCatching { h.release() }
+        val released = slot.onActivityGone(generation) { h -> refreshFromHandle(h) }
+        if (!released) return
         saveLocal()
         syncNow()
-        // Nothing observes the detached player now: stop ticking listening time
+        // Nothing observes the detached player now: stop counting listening time
         // and syncing a frozen position. The next attach reads the real state.
         _state.update { it?.copy(playing = false) }
-        lastTickAt = 0
+        sync.stopTicking()
     }
 
-    /** Returns a live, connected handle — building a new one if needed. Call under [lock]. */
-    private suspend fun ensureHandle(): LightAudioPlayer? {
-        handle?.let { h ->
-            when (h.availability.value) {
-                LightAudioPlayerAvailability.Ready -> return h
-                LightAudioPlayerAvailability.Initializing ->
-                    if (withTimeoutOrNull(READY_TIMEOUT_MS) { h.awaitReady() } == true) return h
-                else -> Unit
-            }
-            dropHandle()
-        }
-        val lightAudio = audio ?: run {
-            _error.value = "Player unavailable. Reopen the tool."
-            return null
-        }
-        val h = try {
-            lightAudio.newPlayer(PLAYER_SPEC)
-        } catch (first: Throwable) {
-            try {
-                lightAudio.newPlayer(FALLBACK_SPEC)
-            } catch (e: Throwable) {
-                _error.value = "Couldn't start the audio player (${first.message}). Try Settings → Reset Player."
-                return null
-            }
-        }
-        handle = h
-        handleGeneration = audioGeneration
-        if (withTimeoutOrNull(READY_TIMEOUT_MS) { h.awaitReady() } != true) {
-            dropHandle()
-            _error.value = "The audio player didn't respond. Try again, or Settings → Reset Player."
-            return null
-        }
-        h.speed = _speed.value
-        observe(h)
-        if (book != null && h.currentMediaItemIndex.value == NO_MEDIA_ITEM) {
-            // The playback service stopped since we last looked (idle timeout
-            // or a crash), taking its queue with it. Keep the book and position
-            // so the next Play re-queues from there.
-            _state.update { it?.copy(playing = false) }
-        } else {
-            refreshFromHandle(h)
-        }
-        return h
-    }
-
-    private fun dropHandle() {
-        observation?.cancel()
-        observation = null
-        val h = handle ?: return
-        handle = null
-        runCatching { h.release() }
-    }
-
-    private fun observe(h: LightAudioPlayer) {
-        observation?.cancel()
-        val errorAtConnect = h.error.value
-        observation = scope.launch {
-            launch {
-                var previous: Boolean? = null
-                h.isPlaying.collect { playing ->
-                    tickListened(wasPlaying = _state.value?.playing == true)
-                    _state.update { it?.copy(playing = playing) }
-                    if (!playing) {
-                        // Only a pause we saw happen counts for rewind-after-pause.
-                        if (previous == true) {
-                            pausedAt = System.currentTimeMillis()
-                            saveLocal()
-                            syncNow()
-                        }
-                    } else {
-                        _error.value = null
-                    }
-                    previous = playing
+    private object SlotEvents : PlayerSlot.Events {
+        override fun onPlayingChanged(playing: Boolean, observedPause: Boolean) {
+            log("playing=$playing observedPause=$observedPause at ${_state.value?.positionMs}")
+            pendingPause?.cancel()
+            pendingPause = null
+            if (!playing && System.currentTimeMillis() < seekingUntil) {
+                // A seek while playing stops the player for a moment while it
+                // buffers the new spot. Don't flash the play button (or count it
+                // as a pause) unless it's still stopped once the seek settles.
+                pendingPause = scope.launch {
+                    delay((seekingUntil - System.currentTimeMillis()).coerceAtLeast(0))
+                    if (slot.current?.isPlaying?.value != true) applyPlaying(false, observedPause)
                 }
+                return
             }
-            launch { h.positionMs.collect { refreshFromHandle(h) } }
-            launch { h.currentMediaItemIndex.collect { refreshFromHandle(h) } }
-            launch {
-                h.durationMs.collect { duration ->
-                    if (duration > 0) applyPendingSeek(h)
-                }
-            }
-            launch {
-                h.error.collect { e ->
-                    if (e != null && e !== errorAtConnect && book != null) {
-                        _state.update { it?.copy(loading = false, playing = false) }
-                        _error.value = "Couldn't play the downloaded file (${e.diagnostic}). " +
-                            "Try removing the download and downloading it again."
-                    }
-                }
+            applyPlaying(playing, observedPause)
+        }
+
+        private fun applyPlaying(playing: Boolean, observedPause: Boolean) {
+            sync.tick(wasPlaying = _state.value?.playing == true, isPlaying = playing)
+            _state.update { it?.copy(playing = playing) }
+            if (playing) {
+                _error.value = null
+            } else if (observedPause) {
+                // Only a pause we saw happen counts for rewind-after-pause.
+                pausedAt = System.currentTimeMillis()
+                saveLocal()
+                syncNow()
             }
         }
-    }
 
-    /** Maps the handle's (track index, offset) onto the book timeline. */
-    private fun refreshFromHandle(h: LightAudioPlayer) {
-        val b = book ?: return
-        val index = h.currentMediaItemIndex.value
-        if (index == NO_MEDIA_ITEM) return
-        val track = b.tracks.getOrNull(index) ?: return
-        // While a seek is pending the handle still reports the old offset.
-        val within = pendingSeekWithinTrackMs ?: h.positionMs.value.coerceAtLeast(0)
-        _state.update {
-            it?.copy(positionMs = (track.startOffset * 1000).toLong() + within, playing = h.isPlaying.value)
+        override fun onPositionChanged(handle: LightAudioPlayer) {
+            refreshFromHandle(handle)
+            checkEndOfChapterTimer()
         }
-    }
 
-    private fun applyPendingSeek(h: LightAudioPlayer) {
-        val pending = pendingSeekWithinTrackMs ?: return
-        if (h.durationMs.value <= 0) return
-        pendingSeekWithinTrackMs = null
-        h.seekTo(pending)
+        override fun onDurationKnown(handle: LightAudioPlayer) = applyPendingSeek(handle)
+
+        override fun onPlaybackError(diagnostic: String) {
+            if (book == null) return
+            _state.update { it?.copy(loading = false, playing = false) }
+            _error.value = "Couldn't play the downloaded file ($diagnostic). " +
+                "Try removing the download and downloading it again."
+        }
+
+        override fun onConnected(handle: LightAudioPlayer) {
+            if (book != null && handle.currentMediaItemIndex.value == NO_MEDIA_ITEM) {
+                // The playback service stopped since we last looked (idle timeout
+                // or a crash), taking its queue with it. Keep the book and position
+                // so the next Play re-queues from there.
+                _state.update { it?.copy(playing = false) }
+            } else {
+                refreshFromHandle(handle)
+                _state.update { it?.copy(playing = handle.isPlaying.value) }
+            }
+        }
+
+        override fun onSlotError(message: String) {
+            log("slot error: $message")
+            _error.value = message
+        }
     }
 
     // ---- Commands --------------------------------------------------------------
@@ -330,6 +223,8 @@ object Playback {
     /**
      * Plays a downloaded book from wherever you left off (on this phone or
      * another device, whichever is newer). If it's already loaded this resumes.
+     * With [startAtMs] (the player already checked the server, or you picked
+     * a spot) it starts there straight away.
      */
     fun playBook(itemId: String, startAtMs: Long? = null) {
         scope.launch {
@@ -339,36 +234,27 @@ object Playback {
         }
     }
 
-    /**
-     * Best position this phone knows for a downloaded book without asking the
-     * server: the newer of local progress and the last library listing.
-     */
-    fun bestKnownPositionSec(itemId: String): Double {
-        val local = LocalProgress.get(itemId)
-        val cached = LibraryCache.load()?.progress?.get(itemId)
-        return when {
-            cached != null && (local == null || cached.lastUpdate > local.updatedAt) -> cached.currentTime
-            else -> local?.positionSec ?: 0.0
-        }
-    }
+    /** Best position this phone knows for a book without asking the server. */
+    fun bestKnownPositionSec(itemId: String): Double =
+        ProgressPolicy.bestKnownPositionSec(LocalProgress.get(itemId), LibraryCache.load()?.progress?.get(itemId))
 
     /**
-     * Newest-wins check against the server for a book about to be shown (the
-     * player preview), so Play can start straight away from the right spot.
-     * Returns false when the server can't be reached. Never throws.
+     * Newest-wins check against the server for a book about to be shown, so
+     * Play can start straight away from the right spot. Returns false when
+     * the server can't be reached. Never throws.
      */
     suspend fun refreshFromServer(itemId: String): Boolean {
         val b = Downloads.book(itemId) ?: return false
-        return withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
-            withContext(Dispatchers.IO) { runCatching { reconcileItem(itemId, b.durationSec) }.isSuccess }
-        } == true
+        return sync.tryReconcile(itemId, b.durationSec).isSuccess
     }
 
     fun togglePlay() {
         scope.launch {
             lock.withLock {
                 if (_state.value?.playing == true) {
-                    ensureHandle()?.pause()
+                    log("pause tapped")
+                    seekingUntil = 0 // a real pause shows at once
+                    slot.ensure()?.pause()
                 } else {
                     resumeLocked()
                 }
@@ -376,24 +262,32 @@ object Playback {
         }
     }
 
-    fun seekBy(deltaMs: Long) {
-        val now = _state.value ?: return
-        seekTo(now.positionMs + deltaMs)
-    }
-
-    /** Seeks on the book's timeline (crossing track boundaries for multi-file books). */
-    fun seekTo(targetMs: Long) {
+    /** Seeks on the book's timeline (crossing file boundaries for multi-file books). */
+    /**
+     * Seeks on the book's timeline (crossing file boundaries for multi-file
+     * books). [dragging]: the seek bar is moving, so wait until it's released
+     * ([finishDrag]) or settles instead of seeking on every step; taps (skip,
+     * chapters) seek at once.
+     */
+    fun seekTo(targetMs: Long, dragging: Boolean = false) {
         val b0 = book ?: return
-        val clamped = targetMs.coerceIn(0, (b0.durationSec * 1000).toLong().coerceAtLeast(0))
-        // Show the target immediately; seek once the user stops dragging.
+        val clamped = targetMs.coerceIn(0, b0.durationMs)
+        dragTargetMs = if (dragging) clamped else null
+        // Show the target immediately, and keep showing it until the player
+        // catches up (it reports the old position for a moment).
+        expectPosition(clamped, SEEK_SETTLE_MS + if (dragging) SEEK_DEBOUNCE_MS else 0)
         _state.update { it?.copy(positionMs = clamped) }
+        retargetEndOfChapterTimer(clamped)
         pausedAt = 0
         seekJob?.cancel()
         seekJob = scope.launch {
-            delay(SEEK_DEBOUNCE_MS)
+            if (dragging) delay(SEEK_DEBOUNCE_MS)
+            // Sent now: letting go of the bar here mustn't seek a second time
+            // (two seeks in a row are audible as a glitch).
+            if (dragTargetMs == clamped) dragTargetMs = null
             lock.withLock {
                 val b = book ?: return@withLock
-                val h = ensureHandle() ?: return@withLock
+                val h = slot.ensure() ?: return@withLock
                 if (h.currentMediaItemIndex.value == NO_MEDIA_ITEM) return@withLock // applied on Play
                 seekHandle(h, b, clamped)
                 saveLocal()
@@ -402,24 +296,64 @@ object Playback {
         }
     }
 
+    /** The seek bar was released: seek to where it was dragged now, without waiting. */
+    fun finishDrag() {
+        val target = dragTargetMs ?: return
+        seekTo(target)
+    }
+
+    /** Where the seek bar is being dragged to (seek not sent yet). */
+    private var dragTargetMs: Long? = null
+
     fun setSpeed(value: Float) {
         _speed.value = value
-        SettingsStore.speed = value
-        handle?.takeIf { it.availability.value == LightAudioPlayerAvailability.Ready }?.speed = value
+        SettingsStore.update { it.copy(speed = value) }
+        slot.ready?.speed = value
+    }
+
+    /** Sets (or with null, cancels) the sleep timer. */
+    fun setSleepTimer(timer: SleepTimer?) {
+        _sleepTimer.value = timer
+    }
+
+    /** A sleep timer that pauses at the end of the chapter playing now. */
+    fun endOfChapterTimer(): SleepTimer? {
+        val now = _state.value ?: return null
+        return chapterEndAfter(now.chapters, now.positionMs)?.let { SleepTimer.EndOfChapter(it) }
     }
 
     /** Stops and unloads [itemId] if it's the loaded book (its download is being removed). */
     fun unload(itemId: String) {
-        scope.launch {
-            lock.withLock {
-                if (book?.itemId != itemId) return@withLock
-                handle?.takeIf { it.availability.value == LightAudioPlayerAvailability.Ready }
-                    ?.let { runCatching { it.stop() } }
-                closeSessionLocked()
-                book = null
-                _state.value = null
-                _error.value = null
-            }
+        scope.launch { lock.withLock { if (book?.itemId == itemId) unloadLocked() } }
+    }
+
+    /**
+     * Marks a book finished on the server. If it's loaded, playback stops
+     * first. Returns a message for the user on failure, null on success.
+     */
+    suspend fun markFinished(itemId: String, durationSec: Double): String? =
+        changeProgress(itemId) {
+            val progress = AbsApi.setFinished(itemId, durationSec)
+            val end = durationSec.takeIf { it > 0 } ?: progress?.duration ?: 0.0
+            LocalProgress.adoptServer(itemId, end, end, progress?.lastUpdate ?: System.currentTimeMillis())
+        }
+
+    /** Forgets a book's progress everywhere ("not started"). Same contract as [markFinished]. */
+    suspend fun markNotStarted(itemId: String, durationSec: Double): String? =
+        changeProgress(itemId) {
+            AbsApi.deleteProgress(itemId)
+            LocalProgress.adoptServer(itemId, 0.0, durationSec, System.currentTimeMillis())
+        }
+
+    private suspend fun changeProgress(itemId: String, change: suspend () -> Unit): String? {
+        lock.withLock { if (book?.itemId == itemId) unloadLocked() }
+        return try {
+            withContext(Dispatchers.IO) { change() }
+            null
+        } catch (e: AbsException) {
+            e.message
+        } catch (e: Exception) {
+            "Couldn't reach the server."
         }
     }
 
@@ -428,31 +362,20 @@ object Playback {
      * player, closes the server session. Everything starts fresh after this.
      */
     fun reset() {
-        scope.launch { lock.withLock { resetLocked() } }
-    }
-
-    private suspend fun resetLocked() {
-        // Get a connected handle (building one if needed) so stop() actually
-        // reaches the playback service instead of being dropped.
-        ensureHandle()?.let { h -> runCatching { h.stop() } }
-        closeSessionLocked()
-        book = null
-        dropHandle()
-        _state.value = null
-        _error.value = null
-        // Prove a player can be created again. If the SDK still refuses (a
-        // detached slot held by something we can't reach), the only remaining
-        // fix is a fresh process — LightOS has no force-stop, so do it for the
-        // user. The tool closes; reopening starts clean.
-        val lightAudio = audio ?: return
-        val probe = runCatching { lightAudio.newPlayer(PLAYER_SPEC) }.getOrNull()
-            ?: runCatching { lightAudio.newPlayer(FALLBACK_SPEC) }.getOrNull()
-        if (probe == null) {
-            android.os.Process.killProcess(android.os.Process.myPid())
-            return
+        scope.launch {
+            lock.withLock {
+                // Get a connected handle (building one if needed) so stop()
+                // actually reaches the playback service instead of being dropped.
+                slot.ensure()?.let { h -> runCatching { h.stop() } }
+                closeSessionLocked()
+                clearLoadedBook()
+                slot.drop()
+                // If the SDK still refuses to build a player, the only remaining
+                // fix is a fresh process — LightOS has no force-stop, so do it for
+                // the user. The tool closes; reopening starts clean.
+                if (!slot.probe()) android.os.Process.killProcess(android.os.Process.myPid())
+            }
         }
-        withTimeoutOrNull(READY_TIMEOUT_MS) { probe.awaitReady() }
-        runCatching { probe.release() }
     }
 
     /**
@@ -462,13 +385,10 @@ object Playback {
     fun signOut(onDone: () -> Unit) {
         scope.launch {
             lock.withLock {
-                handle?.takeIf { it.availability.value == LightAudioPlayerAvailability.Ready }
-                    ?.let { runCatching { it.stop() } }
+                slot.ready?.let { runCatching { it.stop() } }
                 closeSessionLocked()
-                book = null
-                dropHandle()
-                _state.value = null
-                _error.value = null
+                clearLoadedBook()
+                slot.drop()
             }
             val auth = AuthStore.current
             AuthStore.clear()
@@ -476,7 +396,7 @@ object Playback {
             LocalProgress.clear()
             if (auth != null) {
                 withContext(Dispatchers.IO + NonCancellable) {
-                    withTimeoutOrNull(NETWORK_TIMEOUT_MS) { AbsApi.logout(auth) }
+                    withTimeoutOrNull(ProgressSync.NETWORK_TIMEOUT_MS) { AbsApi.logout(auth) }
                 }
             }
             onDone()
@@ -492,197 +412,159 @@ object Playback {
      * the loaded one). Called when the library refreshes successfully.
      */
     fun flushOfflineProgress() {
-        scope.launch(Dispatchers.IO) {
+        scope.launch {
             val loaded = book?.itemId
             LocalProgress.unsynced().forEach { (itemId, local) ->
-                if (itemId != loaded) runCatching { reconcileItem(itemId, local.durationSec) }
+                if (itemId != loaded) runCatching { sync.reconcile(itemId, local.durationSec) }
             }
         }
     }
 
-    // ---- Internals (call under lock) -------------------------------------------
+    // ---- Opening and resuming (call under lock) -----------------------------------
 
     private suspend fun resumeLocked() {
         val b = book ?: return
         val pausedLong = pausedAt == 0L || System.currentTimeMillis() - pausedAt >= CHECK_SERVER_AFTER_PAUSE_MS
-        if (session == null || pausedLong) {
+        if (sync.session == null || pausedLong) {
             // Another device may have moved this book on while it sat paused here.
             saveLocal()
-            val result = withTimeoutOrNull(RESUME_CHECK_TIMEOUT_MS) {
-                withContext(Dispatchers.IO) { runCatching { reconcile(b) } }
-            }
-            // Offline: play straight away from the phone's position.
-            val reachable = result?.isSuccess == true
-            val serverSec = result?.getOrNull()
-            if (serverSec != null) {
+            val result = sync.tryReconcile(b.itemId, b.durationSec, RESUME_CHECK_TIMEOUT_MS)
+            result.getOrNull()?.let { serverSec ->
                 val serverMs = (serverSec * 1000).toLong()
-                if (kotlin.math.abs(serverMs - (_state.value?.positionMs ?: 0)) > 3_000) {
+                if (kotlin.math.abs(serverMs - (_state.value?.positionMs ?: 0)) > SERVER_JUMP_MS) {
                     _state.update { it?.copy(positionMs = serverMs) }
-                    lastSavedPositionMs = serverMs
+                    sync.markSaved(serverMs)
                     pausedAt = 0 // jumping to someone else's spot: no rewind
                 }
             }
-            if (session == null && reachable) tryOpenSession(b)
+            // Offline: play straight away from the phone's position.
+            if (sync.session == null && result.isSuccess) openSessionLocked(b)
         }
         val now = _state.value ?: return
-        val h = ensureHandle() ?: return
+        val h = slot.ensure() ?: return
+        val target = ProgressPolicy.rewindAfterPause(
+            ProgressPolicy.restartIfFinished(now.positionMs, b.durationMs),
+            pausedAt,
+            System.currentTimeMillis(),
+        )
         if (h.currentMediaItemIndex.value == NO_MEDIA_ITEM) {
-            // Service lost its queue — re-queue where we were.
-            loadQueue(h, b, rewindIfLongPause(now.positionMs))
-            startAndVerify(h)
-            return
+            loadQueue(h, b, target) // the service lost its queue: re-queue where we were
+        } else if (target != now.positionMs) {
+            seekHandle(h, b, target)
         }
-        var target = now.positionMs
-        if (b.durationSec > 0 && target >= (b.durationSec * 1000).toLong() - END_EPSILON_MS) target = 0 // finished → restart
-        target = rewindIfLongPause(target)
-        if (target != now.positionMs) seekHandle(h, b, target)
         startAndVerify(h)
     }
 
-    private fun rewindIfLongPause(positionMs: Long): Long =
-        if (pausedAt > 0 && System.currentTimeMillis() - pausedAt >= REWIND_AFTER_PAUSE_MS) {
-            (positionMs - REWIND_MS).coerceAtLeast(0)
-        } else {
-            positionMs
-        }
-
     /**
-     * Loads and plays a downloaded book. With [startAtMs] (the player preview
-     * already checked the server, or you picked a spot) playback starts at
+     * Loads and plays a downloaded book. With [startAtMs] playback starts at
      * once and the sync session opens in the background; without it, the
-     * server is asked first.
+     * server is asked first (newest of phone and server wins).
      */
-    private suspend fun openLocked(itemId: String, startAtMs: Long? = null) {
+    private suspend fun openLocked(itemId: String, startAtMs: Long?) {
         _error.value = null
         val b = Downloads.book(itemId) ?: run {
             _error.value = "Download this book first."
             return
         }
         // Silence and close out whatever was loaded, saving its progress.
-        handle?.takeIf { it.availability.value == LightAudioPlayerAvailability.Ready }
-            ?.let { runCatching { it.pause() } }
+        slot.ready?.let { runCatching { it.pause() } }
         closeSessionLocked()
         book = b
-        val local = LocalProgress.get(itemId)
         _state.value = NowPlaying(
             itemId = itemId,
             title = b.title,
             author = b.author,
-            durationMs = (b.durationSec * 1000).toLong(),
-            positionMs = ((local?.positionSec ?: 0.0) * 1000).toLong(),
+            durationMs = b.durationMs,
+            positionMs = ((LocalProgress.get(itemId)?.positionSec ?: 0.0) * 1000).toLong(),
             playing = false,
             chapters = b.chapters,
             loading = true,
         )
+        val target: Long
         if (startAtMs != null) {
-            session = null
-            resetSyncClock()
-            lastSavedPositionMs = -1 // a chosen spot counts as new progress
-            val target = startAtMs.coerceIn(0, (b.durationSec * 1000).toLong().coerceAtLeast(0))
-            _state.update { it?.copy(positionMs = target) }
-            val h = ensureHandle()
-            if (h == null) {
-                _state.update { it?.copy(loading = false) }
-                return
-            }
-            loadQueue(h, b, target)
-            startAndVerify(h)
-            startSyncLoop()
-            openSessionInBackground(b)
-            return
+            sync.resetClock()
+            sync.markSaved(-1) // a chosen spot counts as new progress
+            target = startAtMs.coerceIn(0, b.durationMs)
+        } else {
+            // Online: newest of phone/server. Offline: newest of phone and the last listing.
+            val reconciled = sync.tryReconcile(itemId, b.durationSec)
+            val startSec = reconciled.getOrNull()
+                ?: if (reconciled.isSuccess) LocalProgress.get(itemId)?.positionSec ?: 0.0 else bestKnownPositionSec(itemId)
+            if (reconciled.isSuccess) openSessionLocked(b)
+            sync.resetClock()
+            sync.markSaved((startSec * 1000).toLong())
+            target = ProgressPolicy.restartIfFinished((startSec * 1000).toLong(), b.durationMs)
         }
-        // Online: newest of phone/server wins, then open a sync session.
-        // Offline: newest of the phone's copy and the last library listing.
-        val reconciled = withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
-            withContext(Dispatchers.IO) { runCatching { reconcile(b) ?: (LocalProgress.get(itemId)?.positionSec ?: 0.0) }.getOrNull() }
-        }
-        val startSec = reconciled ?: run {
-            val cached = LibraryCache.load()?.progress?.get(itemId)
-            when {
-                cached != null && (local == null || cached.lastUpdate > local.updatedAt) -> cached.currentTime
-                else -> local?.positionSec ?: 0.0
-            }
-        }
-        session = null
-        if (reconciled != null) tryOpenSession(b)
-        resetSyncClock()
-        lastSavedPositionMs = (startSec * 1000).toLong()
-        var target = (startSec * 1000).toLong()
-        if (b.durationSec > 0 && target >= (b.durationSec * 1000).toLong() - END_EPSILON_MS) target = 0
-        _state.update { it?.copy(positionMs = target, offline = session == null) }
-        val h = ensureHandle()
+        _state.update { it?.copy(positionMs = target) }
+        // A timer set on the player before Play: end of the chapter Play starts in.
+        retargetEndOfChapterTimer(target)
+        val h = slot.ensure()
         if (h == null) {
             _state.update { it?.copy(loading = false) }
             return
         }
         loadQueue(h, b, target)
         startAndVerify(h)
-        startSyncLoop()
+        startLoop()
+        if (startAtMs != null) openSessionInBackground(b)
     }
 
-    /**
-     * Newest wins between this phone and the server for [b]. If the server is
-     * newer, adopts its position locally and returns it; if the phone has
-     * unsynced listening that's newer, sends it. Throws when offline.
-     */
-    private suspend fun reconcile(b: DownloadedBook): Double? = reconcileItem(b.itemId, b.durationSec)
+    private suspend fun unloadLocked() {
+        slot.ready?.let { runCatching { it.stop() } }
+        closeSessionLocked()
+        clearLoadedBook()
+    }
 
-    /** Opens a server session for syncing (bounded; stays offline on failure). */
-    private suspend fun tryOpenSession(b: DownloadedBook) {
-        lastReconnectAt = System.currentTimeMillis()
-        val opened = withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
-            withContext(Dispatchers.IO) { runCatching { AbsApi.startPlayback(b.itemId) }.getOrNull() }
-        }
-        if (opened != null && book?.itemId == b.itemId) {
-            session = opened
-            sessionStale = false
-            resetSyncClock()
-            _state.update { it?.copy(offline = false) }
+    private fun clearLoadedBook() {
+        book = null
+        pendingSeekWithinTrackMs = null
+        _state.value = null
+        _error.value = null
+        _sleepTimer.value = null
+    }
+
+    private suspend fun closeSessionLocked() {
+        val b = book ?: return
+        pendingSeekWithinTrackMs = null
+        sync.close(b.itemId, _state.value?.takeIf { it.itemId == b.itemId }?.positionMs, b.durationSec)
+    }
+
+    /** Opens a sync session while holding the lock (bounded; stays offline on failure). */
+    private suspend fun openSessionLocked(b: DownloadedBook) {
+        val opened = sync.openSession(b.itemId) ?: return
+        if (book?.itemId == b.itemId) {
+            sync.adopt(opened)
+            sync.resetClock()
         } else {
-            _state.update { it?.copy(offline = true) }
+            sync.discard(opened)
         }
     }
 
-    /**
-     * Opens the sync session without holding the player lock during the
-     * network call, so taps stay responsive while it connects.
-     */
+    /** Opens the sync session without holding the lock, so taps stay responsive meanwhile. */
     private fun openSessionInBackground(b: DownloadedBook) {
-        lastReconnectAt = System.currentTimeMillis()
         scope.launch {
-            val opened = withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
-                withContext(Dispatchers.IO) { runCatching { AbsApi.startPlayback(b.itemId) }.getOrNull() }
-            }
+            val opened = sync.openSession(b.itemId) ?: return@launch
             lock.withLock {
-                if (book?.itemId != b.itemId || session != null) {
+                if (book?.itemId != b.itemId || sync.session != null) {
                     // Switched books meanwhile: don't leave a stray session open.
-                    if (opened != null && session?.id != opened.id) {
-                        launch(Dispatchers.IO) { runCatching { AbsApi.closeSession(opened.id, null) } }
-                    }
+                    if (sync.session?.id != opened.id) sync.discard(opened)
                     return@withLock
                 }
-                if (opened != null) {
-                    session = opened
-                    sessionStale = false
-                    _state.update { it?.copy(offline = false) }
-                    syncNow()
-                } else {
-                    _state.update { it?.copy(offline = true) }
-                }
+                sync.adopt(opened)
+                syncNow()
             }
         }
     }
 
     /** Offline → online while playing: push what we have (newest wins) and get a session. */
-    private suspend fun tryReconnect() {
+    private suspend fun tryReconnectLocked() {
         val b = book ?: return
-        lastReconnectAt = System.currentTimeMillis()
+        sync.noteReconnectAttempt()
         saveLocal()
-        val reachable = withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
-            withContext(Dispatchers.IO) { runCatching { reconcile(b) }.isSuccess }
-        } == true
-        if (reachable) tryOpenSession(b)
+        if (sync.tryReconcile(b.itemId, b.durationSec).isSuccess) openSessionLocked(b)
     }
+
+    // ---- The handle and the book's timeline --------------------------------------
 
     private fun loadQueue(h: LightAudioPlayer, b: DownloadedBook, positionMs: Long) {
         val items = b.tracks.map { track ->
@@ -692,25 +574,63 @@ object Playback {
                 metadata = LightMediaMetadata(title = b.title, artist = b.author),
             )
         }
-        val trackIndex = trackIndexAt(b, positionMs)
-        pendingSeekWithinTrackMs = positionMs - (b.tracks[trackIndex].startOffset * 1000).toLong()
-        h.setMediaQueue(items, trackIndex)
+        val at = trackPositionAt(b.trackStarts, positionMs)
+        pendingSeekWithinTrackMs = at.withinMs
+        expectPosition(positionMs, SEEK_SETTLE_MS)
+        h.setMediaQueue(items, at.index)
         h.speed = _speed.value
         _state.update { it?.copy(positionMs = positionMs) }
         applyPendingSeek(h)
     }
 
     private fun seekHandle(h: LightAudioPlayer, b: DownloadedBook, targetMs: Long) {
-        val index = trackIndexAt(b, targetMs)
-        val within = targetMs - (b.tracks[index].startOffset * 1000).toLong()
-        pendingSeekWithinTrackMs = within
-        if (index != h.currentMediaItemIndex.value) {
-            // The new track's duration resolves asynchronously; applied then.
-            h.seekToDefaultPosition(index)
+        val at = trackPositionAt(b.trackStarts, targetMs)
+        pendingSeekWithinTrackMs = at.withinMs
+        expectPosition(targetMs, SEEK_SETTLE_MS)
+        if (at.index != h.currentMediaItemIndex.value) {
+            // The new track's duration resolves asynchronously; the seek is applied then.
+            h.seekToDefaultPosition(at.index)
         } else {
             applyPendingSeek(h)
         }
         _state.update { it?.copy(positionMs = targetMs) }
+    }
+
+    private fun applyPendingSeek(h: LightAudioPlayer) {
+        val pending = pendingSeekWithinTrackMs ?: return
+        if (h.durationMs.value <= 0) return
+        pendingSeekWithinTrackMs = null
+        h.seekTo(pending)
+    }
+
+    /** Maps the handle's (track, offset) onto the book's timeline. */
+    private fun refreshFromHandle(h: LightAudioPlayer) {
+        val b = book ?: return
+        val index = h.currentMediaItemIndex.value
+        if (index == NO_MEDIA_ITEM || index !in b.tracks.indices) return
+        // While a seek is pending the handle still reports the old offset.
+        val within = pendingSeekWithinTrackMs ?: h.positionMs.value.coerceAtLeast(0)
+        var position = bookPositionMs(b.trackStarts, index, within)
+        expectedPositionMs?.let { expected ->
+            when {
+                // Just after a seek the player still reports where it was: keep
+                // showing the target so the bar doesn't flicker back.
+                System.currentTimeMillis() < expectedUntil &&
+                    kotlin.math.abs(position - expected) > SEEK_TOLERANCE_MS -> position = expected
+                else -> expectedPositionMs = null
+            }
+        }
+        _state.update { it?.copy(positionMs = position) }
+    }
+
+    /** Position the player should report soon (a seek in flight), until [settleMs] from now. */
+    private var expectedPositionMs: Long? = null
+    private var expectedUntil = 0L
+
+    private fun expectPosition(positionMs: Long, settleMs: Long) {
+        expectedPositionMs = positionMs
+        expectedUntil = System.currentTimeMillis() + settleMs
+        seekingUntil = expectedUntil
     }
 
     /**
@@ -721,26 +641,24 @@ object Playback {
     private suspend fun startAndVerify(h: LightAudioPlayer) {
         _state.update { it?.copy(loading = true) }
         h.play()
-        if (awaitPlaying(h)) {
+        if (PlayerSlot.awaitPlaying(h) || h.error.value != null) {
+            // Started — or failed with an error the slot's observer explains.
             _state.update { it?.copy(loading = false) }
             return
         }
-        if (h.error.value != null) {
-            _state.update { it?.copy(loading = false) } // the error collector explains
-            return
-        }
         // Didn't start: rebuild the handle and re-queue at our position.
+        log("play didn't start; rebuilding the player")
         val b = book
         val position = _state.value?.positionMs ?: 0
-        dropHandle()
-        val fresh = ensureHandle()
+        slot.drop()
+        val fresh = slot.ensure()
         if (fresh == null || b == null) {
             _state.update { it?.copy(loading = false) }
             return
         }
         if (fresh.currentMediaItemIndex.value == NO_MEDIA_ITEM) loadQueue(fresh, b, position)
         fresh.play()
-        val started = awaitPlaying(fresh)
+        val started = PlayerSlot.awaitPlaying(fresh)
         _state.update { it?.copy(loading = false) }
         if (!started && fresh.error.value == null) {
             _error.value = "Playback didn't start. Another app may be using audio — " +
@@ -748,168 +666,89 @@ object Playback {
         }
     }
 
-    private suspend fun awaitPlaying(h: LightAudioPlayer): Boolean =
-        withTimeoutOrNull(PLAY_START_TIMEOUT_MS) {
-            h.isPlaying.first { it }
-            true
-        } ?: false
+    // ---- Progress and the sleep timer ---------------------------------------------
 
-    // ---- Progress: phone + server ------------------------------------------------
-
-    private fun resetSyncClock() {
-        val now = System.currentTimeMillis()
-        lastSyncAt = now
-        lastLocalSaveAt = now
-        listenedMsSinceSync = 0
-    }
-
-    private fun startSyncLoop() {
-        if (syncJob?.isActive == true) return
-        syncJob = scope.launch {
-            while (isActive) {
-                delay(1_000)
-                if (_state.value?.playing == true && handle != null) {
-                    tickListened(wasPlaying = true)
-                    val now = System.currentTimeMillis()
-                    if (now - lastLocalSaveAt >= LOCAL_SAVE_INTERVAL_MS) saveLocal()
-                    if (session == null) {
-                        if (now - lastReconnectAt >= RECONNECT_INTERVAL_MS) {
-                            lock.withLock { if (session == null) tryReconnect() }
-                        }
-                    } else if (now - lastSyncAt >= SYNC_INTERVAL_MS) {
-                        syncNow()
-                    }
-                } else {
-                    lastTickAt = 0
-                }
-            }
-        }
-    }
-
-    private fun tickListened(wasPlaying: Boolean) {
-        val now = System.currentTimeMillis()
-        if (wasPlaying && lastTickAt > 0) listenedMsSinceSync += (now - lastTickAt).coerceIn(0, 5_000)
-        lastTickAt = if (wasPlaying || _state.value?.playing == true) now else 0
-    }
-
-    private fun takeListened(): Long = listenedMsSinceSync.also { listenedMsSinceSync = 0 }
-
-    /**
-     * Records the current position on the phone (unsynced until the server has
-     * it). Only real movement is saved, so an idle loaded book never gets a
-     * fresh timestamp that could beat newer progress from another device.
-     */
     private fun saveLocal() {
         val b = book ?: return
         val now = _state.value?.takeIf { it.itemId == b.itemId } ?: return
-        if (lastSavedPositionMs >= 0 && kotlin.math.abs(now.positionMs - lastSavedPositionMs) < 1_000) return
-        lastSavedPositionMs = now.positionMs
-        lastLocalSaveAt = LocalProgress.save(b.itemId, now.positionMs / 1000.0, b.durationSec)
+        sync.saveLocal(b.itemId, now.positionMs, b.durationSec)
     }
 
-    private fun hasUnsynced(b: DownloadedBook): Boolean = LocalProgress.get(b.itemId)?.unsynced == true
-
-    /** Pushes the current position to the server (fire and forget). */
     private fun syncNow() {
         val b = book ?: return
-        val s = session ?: return
         val now = _state.value?.takeIf { it.itemId == b.itemId } ?: return
-        // Nothing new since the server last heard from us: don't resend an old position.
-        if (!hasUnsynced(b) && listenedMsSinceSync == 0L) return
-        lastSyncAt = System.currentTimeMillis()
-        val savedAt = lastLocalSaveAt
-        val listened = takeListened()
-        val positionSec = now.positionMs / 1000.0
-        val stale = sessionStale
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    if (stale) {
-                        AbsApi.patchProgress(b.itemId, positionSec, b.durationSec)
-                    } else {
-                        try {
-                            AbsApi.syncSession(s.id, positionSec, listened / 1000.0, b.durationSec)
-                        } catch (e: SessionGoneException) {
-                            // Server restarted or expired the session: write progress directly.
-                            withContext(Dispatchers.Main) { if (session?.id == s.id) sessionStale = true }
-                            AbsApi.patchProgress(b.itemId, positionSec, b.durationSec)
-                        }
-                    }
+        sync.syncNow(b.itemId, now.positionMs, b.durationSec)
+    }
+
+    /** Once a second while a book is loaded: listening time, saving, syncing, the sleep timer. */
+    private fun startLoop() {
+        if (loopJob?.isActive == true) return
+        loopJob = scope.launch {
+            var lastAt = System.currentTimeMillis()
+            while (isActive) {
+                delay(LOOP_INTERVAL_MS)
+                val now = System.currentTimeMillis()
+                val elapsed = (now - lastAt).coerceIn(0, 5_000)
+                lastAt = now
+                if (_state.value?.playing != true || slot.current == null) {
+                    sync.stopTicking()
+                    continue
                 }
-            }
-            result.fold(
-                onSuccess = {
-                    LocalProgress.markSynced(b.itemId, savedAt)
-                    _state.update { it?.copy(offline = false) }
-                },
-                onFailure = {
-                    // Offline: credit the listening time to the next sync. The
-                    // position is safe on the phone and goes up when we're back.
-                    listenedMsSinceSync += listened
-                    _state.update { it?.copy(offline = true) }
-                },
-            )
-        }
-    }
-
-    /** Final save + sync + close for the loaded book (switching books, reset, sign-out). */
-    private suspend fun closeSessionLocked() {
-        val b = book ?: return
-        saveLocal()
-        val s = session
-        val now = _state.value?.takeIf { it.itemId == b.itemId }
-        val listened = takeListened()
-        session = null
-        val stale = sessionStale
-        sessionStale = false
-        pendingSeekWithinTrackMs = null
-        if (now == null) return
-        val savedAt = lastLocalSaveAt
-        lastSavedPositionMs = -1
-        if (!hasUnsynced(b)) {
-            // Nothing new to report: just close, without a position that could
-            // rewind progress made on another device since.
-            if (s != null && !stale) {
-                withContext(Dispatchers.IO + NonCancellable) {
-                    withTimeoutOrNull(NETWORK_TIMEOUT_MS) { runCatching { AbsApi.closeSession(s.id, null) } }
+                sync.tick(wasPlaying = true, isPlaying = true)
+                if (sync.localSaveDue(now)) saveLocal()
+                if (sync.reconnectDue(now)) {
+                    lock.withLock { if (sync.session == null) tryReconnectLocked() }
+                } else if (sync.syncDue(now)) {
+                    syncNow()
                 }
+                countDownSleepTimer(elapsed)
+                checkEndOfChapterTimer()
             }
-            return
         }
-        // Bounded: a slow server mustn't hold the player lock (and every tap) hostage.
-        val ok = withContext(Dispatchers.IO + NonCancellable) {
-            withTimeoutOrNull(NETWORK_TIMEOUT_MS) {
-                runCatching {
-                    val positionSec = now.positionMs / 1000.0
-                    if (s == null || stale) {
-                        AbsApi.patchProgress(b.itemId, positionSec, b.durationSec)
-                    } else {
-                        AbsApi.closeSession(s.id, AbsApi.FinalSync(positionSec, listened / 1000.0, b.durationSec))
-                    }
-                }.isSuccess
-            } ?: false
-        }
-        if (ok) LocalProgress.markSynced(b.itemId, savedAt)
     }
 
-    /** Newest-wins for one book (see [reconcile]). Throws when offline. */
-    private suspend fun reconcileItem(itemId: String, durationSec: Double): Double? {
-        val local = LocalProgress.get(itemId)
-        val server = AbsApi.progressFor(itemId)
-        if (server != null && (local == null || server.lastUpdate > local.updatedAt)) {
-            LocalProgress.adoptServer(itemId, server.currentTime, durationSec, server.lastUpdate)
-            return server.currentTime
-        }
-        if (local != null && local.unsynced) {
-            AbsApi.patchProgress(itemId, local.positionSec, local.durationSec)
-            LocalProgress.markSynced(itemId, local.updatedAt)
-        }
-        return null
+    private fun countDownSleepTimer(elapsedMs: Long) {
+        val timer = _sleepTimer.value as? SleepTimer.Countdown ?: return
+        val left = timer.remainingMs - elapsedMs
+        if (left > 0) _sleepTimer.value = SleepTimer.Countdown(left) else sleepNow()
     }
 
-    private fun trackIndexAt(b: DownloadedBook, positionMs: Long): Int {
-        val sec = positionMs / 1000.0
-        val index = b.tracks.indexOfLast { it.startOffset <= sec }
-        return index.coerceIn(0, b.tracks.lastIndex)
+    private fun checkEndOfChapterTimer() {
+        val timer = _sleepTimer.value as? SleepTimer.EndOfChapter ?: return
+        val now = _state.value?.takeIf { it.playing } ?: return
+        if (now.positionMs >= timer.endMs - END_OF_CHAPTER_EARLY_MS) sleepNow()
     }
+
+    /** Seeking moves an end-of-chapter timer to the chapter you landed in. */
+    private fun retargetEndOfChapterTimer(positionMs: Long) {
+        if (_sleepTimer.value !is SleepTimer.EndOfChapter) return
+        val chapters = _state.value?.chapters ?: return
+        _sleepTimer.value = chapterEndAfter(chapters, positionMs)?.let { SleepTimer.EndOfChapter(it) }
+    }
+
+    private fun sleepNow() {
+        log("sleep timer: pausing at ${_state.value?.positionMs}")
+        _sleepTimer.value = null
+        seekingUntil = 0
+        scope.launch { lock.withLock { slot.ready?.pause() } }
+    }
+
+    /** Pausing a moment early keeps the next chapter's first words from slipping out. */
+    private const val END_OF_CHAPTER_EARLY_MS = 250L
 }
+
+/** Player events for `adb logcat -s AbsPlayback` — what happened when playback misbehaves. */
+private fun log(message: String) {
+    runCatching { android.util.Log.d("AbsPlayback", message) }
+}
+
+/** End (ms) of the chapter containing [positionMs], or null without chapters. */
+fun chapterEndAfter(chapters: List<Chapter>, positionMs: Long): Long? {
+    if (chapters.isEmpty()) return null
+    val sec = positionMs / 1000.0
+    val chapter = chapters.firstOrNull { sec + 0.001 < it.end } ?: chapters.last()
+    return (chapter.end * 1000).toLong()
+}
+
+private val DownloadedBook.durationMs: Long get() = (durationSec * 1000).toLong().coerceAtLeast(0)
+private val DownloadedBook.trackStarts: List<Double> get() = tracks.map { it.startOffset }

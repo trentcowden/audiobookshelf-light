@@ -56,6 +56,15 @@ android {
         }
     }
 
+    buildFeatures {
+        buildConfig = true // BuildConfig.VERSION_NAME, from lighttool.toml
+    }
+
+    testOptions {
+        // Plain JVM unit tests: android.* calls (logging) become no-ops.
+        unitTests.isReturnDefaultValues = true
+    }
+
     lint {
         warningsAsErrors = false
         error += "RestrictedApi"
@@ -82,6 +91,8 @@ dependencies {
         exclude(group = "androidx.camera")
     }
     testImplementation(libs.kotlin.test)
+    testImplementation(libs.ktor.client.mock)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 /**

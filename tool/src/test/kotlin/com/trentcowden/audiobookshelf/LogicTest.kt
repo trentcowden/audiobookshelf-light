@@ -1,26 +1,24 @@
 package com.trentcowden.audiobookshelf
 
-import com.trentcowden.audiobookshelf.api.AbsApi
+import com.trentcowden.audiobookshelf.api.AbsClient
 import com.trentcowden.audiobookshelf.api.Chapter
 import com.trentcowden.audiobookshelf.screens.chapterIndexAt
 import com.trentcowden.audiobookshelf.screens.chapterStartMs
-import com.trentcowden.audiobookshelf.screens.formatDuration
 import com.trentcowden.audiobookshelf.screens.formatSpeed
-import com.trentcowden.audiobookshelf.screens.BookRow
-import com.trentcowden.audiobookshelf.screens.searchBooks
-import com.trentcowden.audiobookshelf.screens.primarySeries
+import com.trentcowden.audiobookshelf.library.BookRow
+import com.trentcowden.audiobookshelf.library.primarySeries
+import com.trentcowden.audiobookshelf.library.searchBooks
 import com.trentcowden.audiobookshelf.screens.formatTime
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertTrue
 
 class LogicTest {
     @Test
     fun normalizesServerUrls() {
-        assertEquals("https://abs.example.com", AbsApi.normalizeServerUrl(" abs.example.com/ "))
-        assertEquals("http://192.168.1.5:13378", AbsApi.normalizeServerUrl("http://192.168.1.5:13378//"))
-        assertEquals("HTTPS://X.com", AbsApi.normalizeServerUrl("HTTPS://X.com"))
-        assertEquals("", AbsApi.normalizeServerUrl("   "))
+        assertEquals("https://abs.example.com", AbsClient.normalizeServerUrl(" abs.example.com/ "))
+        assertEquals("http://192.168.1.5:13378", AbsClient.normalizeServerUrl("http://192.168.1.5:13378//"))
+        assertEquals("HTTPS://X.com", AbsClient.normalizeServerUrl("HTTPS://X.com"))
+        assertEquals("", AbsClient.normalizeServerUrl("   "))
     }
 
     @Test
@@ -47,9 +45,6 @@ class LogicTest {
         assertEquals("0:05", formatTime(5_000))
         assertEquals("1:02:03", formatTime(3_723_000))
         assertEquals("0:00", formatTime(-10))
-        assertEquals("14h 2m", formatDuration(50_520_000))
-        assertEquals("38m", formatDuration(2_280_000))
-        assertEquals("<1m", formatDuration(30_000))
         assertEquals("1x", formatSpeed(1f))
         assertEquals("1.25x", formatSpeed(1.25f))
     }

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Crescent moon for the sleep timer, solid like the Light SDK icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="40dp"
+    android:viewportWidth="40"
+    android:viewportHeight="40">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M17.51,6.21 A15,15 0 1,0 34.79,23.49 A12.5,12.5 0 0,1 17.51,6.21 Z" />
+</vector>

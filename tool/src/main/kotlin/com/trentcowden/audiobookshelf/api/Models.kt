@@ -9,7 +9,7 @@ import kotlinx.serialization.Serializable
 data class ServerStatus(
     val app: String? = null,
     val serverVersion: String? = null,
-    val isInit: Boolean = false,
+    /** "local" (username + password), "openid" (single sign-on)… */
     val authMethods: List<String> = emptyList(),
 )
 
@@ -44,8 +44,11 @@ internal data class ItemsInProgressResponse(val libraryItems: List<LibraryItem> 
 @Serializable
 data class LibraryItem(
     val id: String,
+    val libraryId: String = "",
     val mediaType: String = "book",
     val media: BookMedia = BookMedia(),
+    /** When the book was added to the server (ms). */
+    val addedAt: Long = 0,
     /** Present on /api/me/items-in-progress results. */
     val progressLastUpdate: Long = 0,
 )
@@ -54,23 +57,32 @@ data class LibraryItem(
 data class BookMedia(
     val metadata: BookMetadata = BookMetadata(),
     val duration: Double = 0.0,
-    val numTracks: Int = 0,
-    val numAudioFiles: Int = 0,
+    /** Audio tracks; 0 for ebook-only items. Null when the server doesn't say. */
+    val numTracks: Int? = null,
 )
 
 @Serializable
 data class BookMetadata(
     val title: String? = null,
+    /** Title without a leading "The"/"A" — what the server sorts by. */
+    val titleIgnorePrefix: String? = null,
     val authorName: String? = null,
+    /** "Last, First" — what the server sorts authors by. */
+    val authorNameLF: String? = null,
     val seriesName: String? = null,
     val narratorName: String? = null,
 )
 
 @Serializable
-internal data class MeResponse(val mediaProgress: List<MediaProgress> = emptyList())
+internal data class MeResponse(
+    val username: String = "",
+    val mediaProgress: List<MediaProgress> = emptyList(),
+)
 
 @Serializable
 data class MediaProgress(
+    /** The progress record's own id (used to delete it). */
+    val id: String? = null,
     val libraryItemId: String,
     val episodeId: String? = null,
     val duration: Double = 0.0,
@@ -81,21 +93,9 @@ data class MediaProgress(
     val lastUpdate: Long = 0,
 )
 
+/** A server playback session; this tool only uses it to sync progress and listening time. */
 @Serializable
-data class PlaybackSession(
-    val id: String,
-    val libraryItemId: String,
-    val displayTitle: String? = null,
-    val displayAuthor: String? = null,
-    /** Seconds. */
-    val duration: Double = 0.0,
-    /** Seconds — where the server says to resume. */
-    val currentTime: Double = 0.0,
-    /** 0 = direct play, 1 = direct stream, 2 = transcode (HLS), 3 = local. */
-    val playMethod: Int = 0,
-    val chapters: List<Chapter> = emptyList(),
-    val audioTracks: List<AudioTrack> = emptyList(),
-)
+data class PlaybackSession(val id: String, val libraryItemId: String = "")
 
 @Serializable
 data class Chapter(
@@ -104,18 +104,6 @@ data class Chapter(
     val start: Double = 0.0,
     val end: Double = 0.0,
     val title: String = "",
-)
-
-@Serializable
-data class AudioTrack(
-    /** 1-based. */
-    val index: Int = 1,
-    /** Seconds from the start of the book. */
-    val startOffset: Double = 0.0,
-    val duration: Double = 0.0,
-    val title: String? = null,
-    val contentUrl: String? = null,
-    val mimeType: String? = null,
 )
 
 /** GET /api/items/{id}?expanded=1 — what a download needs. */

@@ -16,10 +16,17 @@ import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
-import com.trentcowden.audiobookshelf.api.AuthStore
-import com.trentcowden.audiobookshelf.playback.Playback
+import com.trentcowden.audiobookshelf.BuildConfig
 import com.trentcowden.audiobookshelf.downloads.DownloadState
 import com.trentcowden.audiobookshelf.downloads.Downloads
+import com.trentcowden.audiobookshelf.playback.Playback
+import com.trentcowden.audiobookshelf.storage.AuthStore
+import com.trentcowden.audiobookshelf.storage.LibraryCache
+import com.trentcowden.audiobookshelf.storage.LibrarySort
+import com.trentcowden.audiobookshelf.storage.SettingsStore
+
+/** ChoiceScreen value for "every library" (results can't be null). */
+private const val ALL_LIBRARIES = ""
 
 class SettingsViewModel : LightViewModel<Unit>() {
     val signingOut = kotlinx.coroutines.flow.MutableStateFlow(false)
@@ -46,7 +53,28 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
             ) {
                 if (auth != null) {
                     Info("Server", auth.serverUrl.removePrefix("https://"))
-                    Info("Signed in as", auth.username)
+                    Info("Signed in as", auth.username + if (auth.usesApiKey) " (API key)" else "")
+                }
+                val settings by SettingsStore.settings.collectAsState()
+                // Only worth a choice when the server has more than one book library.
+                val libraries = LibraryCache.load()?.libraries.orEmpty()
+                if (libraries.size > 1) {
+                    val chosen = libraries.firstOrNull { it.id == settings.libraryId }
+                    Action("Library", chosen?.name ?: "All libraries") {
+                        val choices = listOf(Choice("All libraries", ALL_LIBRARIES)) +
+                            libraries.map { Choice(it.name.ifBlank { "Untitled" }, it.id) }
+                        navigateTo(screenFactory = {
+                            ChoiceScreen(it, "Library", choices, selected = chosen?.id ?: ALL_LIBRARIES)
+                        }) { id ->
+                            SettingsStore.update { s -> s.copy(libraryId = id.takeIf { it != ALL_LIBRARIES }) }
+                        }
+                    }
+                }
+                Action("Sort books by", settings.sort.label) {
+                    val choices = LibrarySort.entries.map { Choice(it.label, it) }
+                    navigateTo(screenFactory = { ChoiceScreen(it, "Sort by", choices, selected = settings.sort) }) { sort ->
+                        SettingsStore.update { s -> s.copy(sort = sort) }
+                    }
                 }
                 val downloaded = Downloads.states.collectAsState().value.values.count { it is DownloadState.Done }
                 Info(
@@ -71,6 +99,11 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                         }
                     }
                 }
+                LightText(
+                    text = "Version ${BuildConfig.VERSION_NAME}",
+                    variant = LightTextVariant.Fine,
+                    modifier = Modifier.padding(vertical = 1f.gridUnitsAsDp()),
+                )
             }
         }
     }

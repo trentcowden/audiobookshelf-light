@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Three-bar menu icon in the Light SDK icon style (solid bars, square
+     ends). The SDK has no menu icon; LightIcons.LIST is a bulleted list. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="40dp"
+    android:viewportWidth="40"
+    android:viewportHeight="40">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,8.3h32v3.4h-32z M4,18.3h32v3.4h-32z M4,28.3h32v3.4h-32z" />
+</vector>
