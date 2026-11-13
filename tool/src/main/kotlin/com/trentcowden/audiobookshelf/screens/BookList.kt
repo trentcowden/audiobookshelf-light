@@ -123,7 +123,9 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
                         lighten = true,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 0.2f.gridUnitsAsDp()),
+                        // Tight under the title (it describes the title); the
+                        // author gets a little more room below.
+                        lineHeight = 1.15.em,
                     )
                 }
                 val detail = listOfNotNull(row.author, downloadLabel).joinToString(" · ")
@@ -131,7 +133,7 @@ private fun RowScope.BookRowBody(row: BookRow, downloadLabel: String?, themeColo
                     LightText(
                         text = detail,
                         variant = LightTextVariant.Detail,
-                        modifier = if (series == null) Modifier.padding(top = 0.2f.gridUnitsAsDp()) else Modifier,
+                        modifier = Modifier.padding(top = if (series == null) 0.2f.gridUnitsAsDp() else 0.35f.gridUnitsAsDp()),
                     )
                 }
             }
