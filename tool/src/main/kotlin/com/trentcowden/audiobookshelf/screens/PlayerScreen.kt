@@ -51,6 +51,9 @@ import com.trentcowden.audiobookshelf.playback.Playback
 import com.trentcowden.audiobookshelf.playback.SleepTimer
 import com.trentcowden.audiobookshelf.playback.chapterEndAfter
 import com.trentcowden.audiobookshelf.storage.LibraryCache
+import com.trentcowden.audiobookshelf.storage.LocalProgress
+import com.trentcowden.audiobookshelf.library.ProgressState
+import com.trentcowden.audiobookshelf.library.progressState
 import com.trentcowden.audiobookshelf.storage.SettingsStore
 
 /**
@@ -77,6 +80,13 @@ class PlayerViewModel(private val itemId: String) : LightViewModel<Unit>() {
         get() = Downloads.book(itemId)?.durationSec
             ?: LibraryCache.load()?.books?.firstOrNull { it.id == itemId }?.durationSec
             ?: 0.0
+
+    /** Finished / started, from the phone's best knowledge (the loaded book counts as started if it's moved). */
+    fun progressState(): ProgressState {
+        val state = progressState(LibraryCache.load()?.progress?.get(itemId), LocalProgress.get(itemId))
+        val live = Playback.state.value?.takeIf { it.itemId == itemId }
+        return if (live != null && live.positionMs >= 1_000) state.copy(started = true) else state
+    }
 
     fun markFinished() = changeProgress("Marked as finished.") { Playback.markFinished(itemId, durationSec) }
 
@@ -407,14 +417,15 @@ class PlayerScreen(
     }
 
     private fun openMenu(download: DownloadState?) {
+        val progress = viewModel.progressState()
         val choices = listOfNotNull(
             when (download) {
                 is DownloadState.Done -> Choice("Remove download", BookAction.REMOVE_DOWNLOAD, "Your progress is kept.")
                 null -> null
                 else -> Choice("Cancel download", BookAction.REMOVE_DOWNLOAD)
             },
-            Choice("Mark as finished", BookAction.MARK_FINISHED),
-            Choice("Mark as not started", BookAction.MARK_NOT_STARTED, "Resets your progress."),
+            Choice("Mark as finished", BookAction.MARK_FINISHED).takeIf { !progress.finished },
+            Choice("Mark as not started", BookAction.MARK_NOT_STARTED, "Resets your progress.").takeIf { progress.started },
         )
         navigateTo(screenFactory = { ChoiceScreen(it, "", choices) }) { action ->
             when (action) {

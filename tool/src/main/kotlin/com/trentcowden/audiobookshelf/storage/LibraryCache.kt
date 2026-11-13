@@ -50,6 +50,12 @@ object LibraryCache {
         file?.write(library)
     }
 
+    /** Records a progress change made from this phone (mark finished / not started). */
+    fun updateProgress(itemId: String, progress: MediaProgress?) = synchronized(this) {
+        val current = load() ?: return@synchronized
+        save(current.copy(progress = if (progress == null) current.progress - itemId else current.progress + (itemId to progress)))
+    }
+
     fun clear() = synchronized(this) {
         cached = null
         file?.delete()

@@ -11,6 +11,10 @@ import com.trentcowden.audiobookshelf.api.PermanentDownloadException
 import com.trentcowden.audiobookshelf.api.TrackFileMetadata
 import com.trentcowden.audiobookshelf.downloads.manifestFrom
 import com.trentcowden.audiobookshelf.library.CatalogBook
+import com.trentcowden.audiobookshelf.library.ProgressState
+import com.trentcowden.audiobookshelf.library.SeriesPosition
+import com.trentcowden.audiobookshelf.library.progressState
+import com.trentcowden.audiobookshelf.library.seriesPosition
 import com.trentcowden.audiobookshelf.library.bookRow
 import com.trentcowden.audiobookshelf.library.isListenable
 import com.trentcowden.audiobookshelf.library.sortBooks
@@ -68,6 +72,47 @@ class CatalogTest {
         // By author, then title; no author last.
         assertEquals(listOf("2", "4", "1", "3"), sortBooks(books, LibrarySort.AUTHOR).map { it.id })
         assertEquals(listOf("4", "2", "3", "1"), sortBooks(books, LibrarySort.RECENTLY_ADDED).map { it.id })
+    }
+
+    @Test
+    fun authorSortKeepsSeriesInReadingOrder() {
+        val dcc = { id: String, n: String, title: String ->
+            CatalogBook(id, title = title, sortAuthor = "Dinniman, Matt", series = "Dungeon Crawler Carl #$n")
+        }
+        val books = listOf(
+            dcc("6", "6", "The Eye of the Bedlam Bride"),
+            dcc("1", "1", "Dungeon Crawler Carl"),
+            dcc("10", "10", "A Tenth Book"),
+            dcc("2", "2", "Carl's Doomsday Scenario"),
+            dcc("2.5", "2.5", "A Novella"),
+            CatalogBook("k", title = "Kaiju: Battlefield Surgeon", sortAuthor = "Dinniman, Matt"),
+            CatalogBook("a", title = "Alpha Standalone", sortAuthor = "Dinniman, Matt"),
+            CatalogBook("h", title = "Dune", sortAuthor = "Herbert, Frank", series = "Dune #1, The Dune Sequence #12"),
+        )
+        // Series sit among standalones by series name ("Dungeon…" between "Alpha" and "Kaiju").
+        assertEquals(listOf("a", "1", "2", "2.5", "6", "10", "k", "h"), sortBooks(books, LibrarySort.AUTHOR).map { it.id })
+    }
+
+    @Test
+    fun readsSeriesPositions() {
+        assertEquals(SeriesPosition("Dune", 1.0), seriesPosition("Dune #1, The Dune Sequence #12"))
+        assertEquals(SeriesPosition("Earth, Wind & Fire", 2.5), seriesPosition("Earth, Wind & Fire #2.5"))
+        assertEquals(SeriesPosition("Discworld", null), seriesPosition("Discworld"))
+        assertNull(seriesPosition(null))
+    }
+
+    @Test
+    fun knowsWhetherABookIsStartedOrFinished() {
+        val server = MediaProgress(libraryItemId = "1", currentTime = 300.0, lastUpdate = 100)
+        assertEquals(ProgressState(finished = false, started = true), progressState(server, null))
+        assertEquals(ProgressState(finished = true, started = true), progressState(server.copy(isFinished = true), null))
+        assertEquals(ProgressState(finished = false, started = false), progressState(null, null))
+        // Marked not started on this phone after the server's last word.
+        val reset = LocalPosition(0.0, 100.0, updatedAt = 200, unsynced = false)
+        assertEquals(ProgressState(finished = false, started = false), progressState(server, reset))
+        // Marked finished: the phone adopts the server's own timestamp, so it isn't "newer".
+        val adopted = LocalPosition(100.0, 100.0, updatedAt = 100, unsynced = false)
+        assertEquals(ProgressState(finished = true, started = true), progressState(server.copy(isFinished = true), adopted))
     }
 
     @Test

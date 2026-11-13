@@ -64,11 +64,18 @@ fun sortBooks(books: List<CatalogBook>, sort: LibrarySort): List<CatalogBook> {
     return when (sort) {
         LibrarySort.TITLE -> books.sortedWith(byTitle)
         // No author sorts last.
-        LibrarySort.AUTHOR -> books.sortedWith(
-            compareBy<CatalogBook> { it.sortAuthor == null }
-                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.sortAuthor.orEmpty() }
-                .then(byTitle),
-        )
+        // By author; within an author, each series in reading order (placed
+        // by series name among the standalone titles). No author sorts last.
+        LibrarySort.AUTHOR -> {
+            val series = books.associate { it.id to seriesPosition(it.series) }
+            books.sortedWith(
+                compareBy<CatalogBook> { it.sortAuthor == null }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.sortAuthor.orEmpty() }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { series[it.id]?.name ?: it.sortTitle }
+                    .thenBy(nullsLast()) { series[it.id]?.sequence }
+                    .then(byTitle),
+            )
+        }
         LibrarySort.RECENTLY_ADDED -> books.sortedWith(compareByDescending<CatalogBook> { it.addedAt }.then(byTitle))
     }
 }
@@ -93,6 +100,30 @@ fun bookRow(book: CatalogBook, server: MediaProgress?, local: LocalPosition?): B
         series = book.series,
         narrator = book.narrator,
     )
+}
+
+/** A book's place in its (first) series: "Dune #2" → ("Dune", 2.0). */
+data class SeriesPosition(val name: String, val sequence: Double?)
+
+fun seriesPosition(seriesName: String?): SeriesPosition? {
+    val first = primarySeries(seriesName) ?: return null
+    val match = Regex("""^(.*?)\s*#([\d.]+)$""").find(first)
+        ?: return SeriesPosition(first, null)
+    return SeriesPosition(match.groupValues[1], match.groupValues[2].toDoubleOrNull())
+}
+
+/** Whether a book is finished, and whether it's been started at all (finished counts). */
+data class ProgressState(val finished: Boolean, val started: Boolean)
+
+/**
+ * From the server's progress and the phone's: finished as the server says,
+ * unless the phone has listened since; started when there's any position.
+ */
+fun progressState(server: MediaProgress?, local: LocalPosition?): ProgressState {
+    val phoneIsNewer = local != null && (server == null || local.updatedAt > server.lastUpdate)
+    val finished = server?.isFinished == true && !phoneIsNewer
+    val positionSec = if (phoneIsNewer) local!!.positionSec else server?.currentTime ?: local?.positionSec ?: 0.0
+    return ProgressState(finished = finished, started = finished || positionSec >= 1.0)
 }
 
 /**

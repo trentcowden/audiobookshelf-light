@@ -335,7 +335,14 @@ object Playback {
         changeProgress(itemId) {
             val progress = AbsApi.setFinished(itemId, durationSec)
             val end = durationSec.takeIf { it > 0 } ?: progress?.duration ?: 0.0
-            LocalProgress.adoptServer(itemId, end, end, progress?.lastUpdate ?: System.currentTimeMillis())
+            val at = progress?.lastUpdate ?: System.currentTimeMillis()
+            LocalProgress.adoptServer(itemId, end, end, at)
+            LibraryCache.updateProgress(
+                itemId,
+                progress ?: com.trentcowden.audiobookshelf.api.MediaProgress(
+                    libraryItemId = itemId, currentTime = end, duration = end, progress = 1.0, isFinished = true, lastUpdate = at,
+                ),
+            )
         }
 
     /** Forgets a book's progress everywhere ("not started"). Same contract as [markFinished]. */
@@ -343,6 +350,7 @@ object Playback {
         changeProgress(itemId) {
             AbsApi.deleteProgress(itemId)
             LocalProgress.adoptServer(itemId, 0.0, durationSec, System.currentTimeMillis())
+            LibraryCache.updateProgress(itemId, null)
         }
 
     private suspend fun changeProgress(itemId: String, change: suspend () -> Unit): String? {
