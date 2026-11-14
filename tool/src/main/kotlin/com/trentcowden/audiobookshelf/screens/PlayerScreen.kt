@@ -200,61 +200,64 @@ class PlayerScreen(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     verticalArrangement = Arrangement.SpaceEvenly,
                 ) {
-                when {
-                    live != null -> LiveControls(live, speed, preview = false)
-                    download is DownloadState.Done -> {
-                        // Not loaded yet: show the whole player from the download
-                        // and the best-known position; Play starts from there.
-                        val previewMs by viewModel.previewPositionMs.collectAsState()
-                        LiveControls(
-                            NowPlaying(
-                                itemId = itemId,
-                                title = download.book.title,
-                                author = download.book.author,
-                                durationMs = (download.book.durationSec * 1000).toLong(),
-                                positionMs = previewMs,
-                                playing = false,
-                                chapters = download.book.chapters,
-                            ),
-                            speed,
-                            preview = true,
-                        )
+                    when {
+                        live != null -> LiveControls(live, speed, preview = false)
+                        download is DownloadState.Done -> {
+                            // Not loaded yet: show the whole player from the download
+                            // and the best-known position; Play starts from there.
+                            val previewMs by viewModel.previewPositionMs.collectAsState()
+                            LiveControls(
+                                NowPlaying(
+                                    itemId = itemId,
+                                    title = download.book.title,
+                                    author = download.book.author,
+                                    durationMs = (download.book.durationSec * 1000).toLong(),
+                                    positionMs = previewMs,
+                                    playing = false,
+                                    chapters = download.book.chapters,
+                                ),
+                                speed,
+                                preview = true,
+                            )
+                        }
+
+                        download is DownloadState.Queued -> Status("Waiting to download…")
+                        download is DownloadState.Running -> Column(modifier = Modifier.fillMaxWidth()) {
+                            val fraction = download.doneBytes.toFloat() / download.totalBytes.coerceAtLeast(1)
+                            Status("Downloading… ${(fraction * 100).toInt().coerceIn(0, 99)}%")
+                            LightText(
+                                text = "${formatMegabytes(download.doneBytes)} of ${formatMegabytes(download.totalBytes)}" +
+                                        " · keep the tool open",
+                                variant = LightTextVariant.Detail,
+                                align = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth().padding(top = 0.5f.gridUnitsAsDp()),
+                            )
+                        }
+
+                        download is DownloadState.Failed -> Column(modifier = Modifier.fillMaxWidth()) {
+                            Status(if (download.message == Downloads.PAUSED) "Download paused." else download.message)
+                            BigButton(LightIcons.DOWNLOAD_ARROW, "Resume download") {
+                                Downloads.download(itemId, title, author)
+                            }
+                        }
+
+                        else -> Column(modifier = Modifier.fillMaxWidth()) {
+                            Status("Download to listen")
+                            BigButton(LightIcons.DOWNLOAD_ARROW, "Download") {
+                                Downloads.download(itemId, title, author)
+                            }
+                        }
                     }
-                    download is DownloadState.Queued -> Status("Waiting to download…")
-                    download is DownloadState.Running -> Column(modifier = Modifier.fillMaxWidth()) {
-                        val fraction = download.doneBytes.toFloat() / download.totalBytes.coerceAtLeast(1)
-                        Status("Downloading… ${(fraction * 100).toInt().coerceIn(0, 99)}%")
+                    val notice by viewModel.notice.collectAsState()
+                    val busy by viewModel.busy.collectAsState()
+                    (error ?: if (busy) "Updating…" else notice)?.let {
                         LightText(
-                            text = "${formatMegabytes(download.doneBytes)} of ${formatMegabytes(download.totalBytes)}" +
-                                " · keep the tool open",
+                            text = it,
                             variant = LightTextVariant.Detail,
                             align = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth().padding(top = 0.5f.gridUnitsAsDp()),
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                    download is DownloadState.Failed -> Column(modifier = Modifier.fillMaxWidth()) {
-                        Status(if (download.message == Downloads.PAUSED) "Download paused." else download.message)
-                        BigButton(LightIcons.DOWNLOAD_ARROW, "Resume download") {
-                            Downloads.download(itemId, title, author)
-                        }
-                    }
-                    else -> Column(modifier = Modifier.fillMaxWidth()) {
-                        Status("Download to listen")
-                        BigButton(LightIcons.DOWNLOAD_ARROW, "Download") {
-                            Downloads.download(itemId, title, author)
-                        }
-                    }
-                }
-                val notice by viewModel.notice.collectAsState()
-                val busy by viewModel.busy.collectAsState()
-                (error ?: if (busy) "Updating…" else notice)?.let {
-                    LightText(
-                        text = it,
-                        variant = LightTextVariant.Detail,
-                        align = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
                 }
             }
         }
@@ -410,6 +413,7 @@ class PlayerScreen(
                     SleepChoice.OFF -> null
                     SleepChoice.END_OF_CHAPTER ->
                         chapterEndAfter(live.chapters, live.positionMs)?.let { SleepTimer.EndOfChapter(it) }
+
                     else -> SleepTimer.Countdown(choice.minutes * 60_000L)
                 },
             )
@@ -420,12 +424,12 @@ class PlayerScreen(
         val progress = viewModel.progressState()
         val choices = listOfNotNull(
             when (download) {
-                is DownloadState.Done -> Choice("Remove download", BookAction.REMOVE_DOWNLOAD, "Your progress is kept.")
+                is DownloadState.Done -> Choice("Remove download", BookAction.REMOVE_DOWNLOAD)
                 null -> null
                 else -> Choice("Cancel download", BookAction.REMOVE_DOWNLOAD)
             },
             Choice("Mark as finished", BookAction.MARK_FINISHED).takeIf { !progress.finished },
-            Choice("Mark as not started", BookAction.MARK_NOT_STARTED, "Resets your progress.").takeIf { progress.started },
+            Choice("Mark as not started", BookAction.MARK_NOT_STARTED).takeIf { progress.started },
         )
         navigateTo(screenFactory = { ChoiceScreen(it, "", choices) }) { action ->
             when (action) {

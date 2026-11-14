@@ -30,6 +30,8 @@ The tool talks only to the Audiobookshelf server you enter. No analytics, no ads
 ## Known issues
 
 - The volume buttons change the ringer volume while the tool is open, not the media volume. This is LightOS behaviour ([light-sdk #189](https://github.com/lightphone/light-sdk/issues/189)); tools can't change it.
+- There's no Bluetooth button: tools can't open Bluetooth settings yet ([light-sdk #191](https://github.com/lightphone/light-sdk/issues/191)). Connect headphones from LightOS's settings.
+- When Bluetooth headphones disconnect, playback carries on through the phone's speaker instead of pausing ([light-sdk #300](https://github.com/lightphone/light-sdk/issues/300)).
 - Offline listening updates your position but isn't counted in Audiobookshelf's listening stats.
 
 ## If playback gets stuck
